@@ -1,1 +1,1 @@
-"""LightScientist tools."""
+"""LightCoder development tools."""

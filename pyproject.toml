@@ -1,16 +1,15 @@
 [project]
-name = "lightscientist"
-version = "0.1.0"
-description = "Three-layer control structure prototype for LightScientist."
+name = "lightcoder"
+version = "0.2.0"
+description = "Persistent single-agent runtime for long-running coding tasks."
 requires-python = ">=3.11"
-dependencies = ["deepagents>=0.5.3", "langchain-openai>=1.1.16"]
+dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-lightscientist = "esnext.cli:main"
-esnext = "esnext.cli:main"
+lightcoder = "lightcoder.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -18,6 +17,23 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/lightcoder/skills" = ["skills/manifest.json"]
+"share/lightcoder/skills/profile-task" = ["skills/profile-task/SKILL.md"]
+"share/lightcoder/skills/plan-work" = ["skills/plan-work/SKILL.md"]
+"share/lightcoder/skills/execute-work-item" = ["skills/execute-work-item/SKILL.md"]
+"share/lightcoder/skills/verify-work-item" = ["skills/verify-work-item/SKILL.md"]
+"share/lightcoder/skills/diagnose-and-replan" = ["skills/diagnose-and-replan/SKILL.md"]
+"share/lightcoder/skills/manage-context-handoff" = ["skills/manage-context-handoff/SKILL.md"]
+"share/lightcoder/skills/finalize-delivery" = ["skills/finalize-delivery/SKILL.md"]
+"share/lightcoder/skills/repair" = ["skills/repair/SKILL.md"]
+"share/lightcoder/skills/feature" = ["skills/feature/SKILL.md"]
+"share/lightcoder/skills/project" = ["skills/project/SKILL.md"]
+"share/lightcoder/skills/transformation" = ["skills/transformation/SKILL.md"]
+"share/lightcoder/skills/optimization" = ["skills/optimization/SKILL.md"]
+"share/lightcoder/skills/generalist" = ["skills/generalist/SKILL.md"]
+"share/lightcoder/skills/long-horizon" = ["skills/long-horizon/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
