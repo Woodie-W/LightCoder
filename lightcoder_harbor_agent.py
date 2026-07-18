@@ -201,6 +201,7 @@ else
   export PYTHONHOME={shlex.quote(remote_runtime)}
   export PATH={shlex.quote(remote_runtime)}/bin:$PATH
   export LD_LIBRARY_PATH={shlex.quote(remote_runtime)}/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
+  export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
   PYTHON_BIN={shlex.quote(remote_runtime)}/bin/python3
 fi
 export PYTHONPATH={escaped_remote_src}/src
