@@ -4,6 +4,8 @@ __pycache__/
 
 .venv/
 .env
+python-runtime/
+runs/
 outputs/
 agent-run.md
 *.log

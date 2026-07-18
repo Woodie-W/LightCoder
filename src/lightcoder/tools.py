@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tarfile
@@ -120,6 +121,51 @@ class WorkspaceTools:
                 "write", call_id, False, time.monotonic() - started, output=str(error)
             )
 
+    def edit(
+        self,
+        path: str,
+        old: str,
+        new: str,
+        *,
+        replace_all: bool = False,
+    ) -> ToolResult:
+        started = time.monotonic()
+        call_id = new_id("edit")
+        try:
+            target = self.resolve_path(path, write=True)
+            if not target.is_file():
+                raise FileNotFoundError(path)
+            if not old:
+                raise ToolPolicyError("edit old text must not be empty")
+            content = target.read_text(encoding="utf-8", errors="strict")
+            matches = content.count(old)
+            if matches == 0:
+                raise ToolPolicyError("edit old text was not found")
+            if matches > 1 and not replace_all:
+                raise ToolPolicyError(
+                    f"edit old text matched {matches} times; use replace_all explicitly"
+                )
+            updated = content.replace(old, new) if replace_all else content.replace(old, new, 1)
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            with temporary.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            relative = str(target.relative_to(self.workspace))
+            return ToolResult(
+                "edit",
+                call_id,
+                True,
+                time.monotonic() - started,
+                output=f"replaced {matches if replace_all else 1} occurrence(s) in {relative}",
+                affected_paths=[relative],
+            )
+        except (OSError, UnicodeError, ToolPolicyError) as error:
+            return ToolResult(
+                "edit", call_id, False, time.monotonic() - started, output=str(error)
+            )
+
     def compact(self, value: str) -> str:
         if len(value) <= self.max_context_chars:
             return value
@@ -129,23 +175,26 @@ class WorkspaceTools:
 
     def workspace_revision(self) -> str:
         hasher = hashlib.sha256()
-        git = subprocess.run(
-            [
-                "git",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--",
-                ".",
-                ":(exclude).lightcoder",
-            ],
-            cwd=self.workspace,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if git.returncode == 0:
+        try:
+            git = subprocess.run(
+                [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--",
+                    ".",
+                    ":(exclude).lightcoder",
+                ],
+                cwd=self.workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError:
+            git = None
+        if git is not None and git.returncode == 0:
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
                 cwd=self.workspace,
@@ -155,9 +204,21 @@ class WorkspaceTools:
                 check=False,
             ).stdout.strip()
             hasher.update(head.encode())
-            hasher.update(git.stdout)
             diff = subprocess.run(
-                ["git", "diff", "--binary", "HEAD", "--", ".", ":(exclude).lightcoder"],
+                [
+                    "git",
+                    "diff",
+                    "--binary",
+                    "HEAD",
+                    "--",
+                    ".",
+                    ":(exclude).git",
+                    ":(exclude).lightcoder",
+                    ":(exclude).venv",
+                    ":(exclude)node_modules",
+                    ":(exclude)target",
+                    ":(exclude)venv",
+                ],
                 cwd=self.workspace,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -165,11 +226,14 @@ class WorkspaceTools:
             )
             hasher.update(diff.stdout)
             for entry in git.stdout.split(b"\0"):
-                if not entry.startswith(b"?? "):
+                if len(entry) <= 3:
                     continue
                 path = entry[3:].decode(errors="surrogateescape")
                 target = self.workspace / path
-                if target.is_file() and not self._is_runtime_path(target):
+                if self._is_runtime_path(target):
+                    continue
+                hasher.update(entry)
+                if entry.startswith(b"?? ") and target.is_file():
                     hasher.update(path.encode(errors="surrogateescape"))
                     try:
                         hasher.update(target.read_bytes())
@@ -191,23 +255,26 @@ class WorkspaceTools:
         return f"sha256:{hasher.hexdigest()}"
 
     def changed_files(self) -> list[str]:
-        result = subprocess.run(
-            [
-                "git",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--",
-                ".",
-                ":(exclude).lightcoder",
-            ],
-            cwd=self.workspace,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if result.returncode != 0:
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--",
+                    ".",
+                    ":(exclude).lightcoder",
+                ],
+                cwd=self.workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError:
+            result = None
+        if result is None or result.returncode != 0:
             return sorted(
                 str(path.relative_to(self.workspace))
                 for path in self.workspace.rglob("*")
@@ -225,20 +292,26 @@ class WorkspaceTools:
             text = record.decode("utf-8", errors="surrogateescape")
             if len(text) <= 3:
                 continue
-            paths.append(text[3:])
+            path = text[3:]
+            if self._is_runtime_path(self.workspace / path):
+                continue
+            paths.append(path)
             if text[0] in {"R", "C"} or text[1] in {"R", "C"}:
                 skip_rename_source = True
         return sorted(set(paths))
 
     def git_head(self) -> str:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=self.workspace,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.workspace,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError:
+            return ""
         return result.stdout.strip() if result.returncode == 0 else ""
 
     def create_checkpoint_snapshot(self, checkpoint_id: str, paths: list[str]) -> str:
@@ -274,12 +347,66 @@ class WorkspaceTools:
             return ""
         return str(snapshot.relative_to(self.store.run_dir))
 
+    def restore_checkpoint_snapshot(self, snapshot_path: str) -> list[str]:
+        """Restore regular files from a controller-created checkpoint archive."""
+        if not snapshot_path:
+            return []
+        snapshot = (self.store.run_dir / snapshot_path).resolve()
+        try:
+            snapshot.relative_to(self.store.checkpoints_dir.resolve())
+        except ValueError as error:
+            raise ToolPolicyError("checkpoint snapshot is outside the run store") from error
+        if not snapshot.is_file():
+            raise FileNotFoundError(f"checkpoint snapshot not found: {snapshot_path}")
+
+        restored: list[str] = []
+        with tarfile.open(snapshot, "r:gz") as archive:
+            for member in archive.getmembers():
+                relative = Path(member.name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ToolPolicyError("unsafe path in checkpoint snapshot")
+                target = (self.workspace / relative).resolve()
+                try:
+                    target.relative_to(self.workspace)
+                except ValueError as error:
+                    raise ToolPolicyError("checkpoint member escapes workspace") from error
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    # Controller snapshots do not need links or device entries;
+                    # ignoring them also prevents link-based path traversal.
+                    continue
+                source = archive.extractfile(member)
+                if source is None:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with source, target.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+                os.chmod(target, member.mode & 0o777)
+                restored.append(str(relative))
+        return restored
+
     def _is_runtime_path(self, path: Path) -> bool:
         try:
             relative = path.resolve().relative_to(self.workspace)
         except ValueError:
             return False
-        return bool(relative.parts and relative.parts[0] == ".lightcoder")
+        if not relative.parts:
+            return False
+        ignored_parts = {
+            ".git",
+            ".lightcoder",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".venv",
+            "__pycache__",
+            "node_modules",
+            "target",
+            "venv",
+        }
+        return any(part in ignored_parts for part in relative.parts)
 
 
 class CommandSupervisor:

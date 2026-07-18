@@ -38,7 +38,7 @@ class CompletingModel:
 
     def complete(self, messages: list[ChatMessage]) -> ModelResponse:
         self.calls += 1
-        prompt = messages[1].content
+        prompt = "\n".join(message.content for message in messages)
         command_evidence = re.findall(
             r'"id": "(ev-[^"]+)"(?:(?!"id":).){0,1400}?"kind": "command"'
             r'(?:(?!"id":).){0,1400}?"exit_code": 0',
@@ -112,6 +112,14 @@ class CompletingModel:
                 if command_evidence
                 else {"action": "bash", "command": "test -f marker.txt"}
             )
+        elif (
+            '"action":"begin_final_verification"' in prompt
+            and (self.workspace / "marker.txt").exists()
+        ):
+            action = {
+                "action": "begin_final_verification",
+                "rationale": "flat task is ready",
+            }
         elif not (self.workspace / "marker.txt").exists():
             action = {"action": "write", "path": "marker.txt", "content": "ok\n"}
         else:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import shlex
+import tarfile
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -30,12 +33,17 @@ PROFILE_ACTIONS = """Return profile_task:
 
 PLAN_ACTIONS = """Return set_plan with a dependency DAG:
 {"action":"set_plan","work_items":[{"id":"W1","title":"...","description":"concrete outcome","kind":"capability|experiment|integration|verification|hardening","playbook":"repair|feature|project|transformation|optimization|generalist","dependencies":[],"mandatory":true,"acceptance":["concrete observable"],"verification_commands":["exact shell command that establishes acceptance"]}]}
-Every mandatory item requires at least one verification command."""
+Every mandatory item requires at least one verification command.
+For a multi-hour task, prefer 3-6 substantial vertical milestones rather than one item per file or endpoint. The first milestone must produce a scoreable end-to-end artifact, not only scaffolding.
+Mandatory work items must describe a path to satisfying the objective, including iteration or strategy changes when needed; never make "report/flag failure" the terminal plan for a required outcome.
+Verification commands must be executable in the observed environment. Use python3 rather than python unless a python executable has already been observed. Prefer Python standard-library checks for numeric thresholds instead of assuming utilities such as bc are installed."""
 
 WORK_ACTIONS = """Return exactly one action:
 {"action":"bash","command":"...","cwd":".","timeout_seconds":1800,"background":false,"rationale":"..."}
 {"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
 {"action":"write","path":"...","content":"...","rationale":"..."}
+{"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
+{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"bash","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
 {"action":"poll","command_id":"cmd-..."}
 {"action":"terminate","command_id":"cmd-..."}
 {"action":"begin_verification","rationale":"implementation is ready for its acceptance oracle"}
@@ -45,7 +53,36 @@ WORK_ACTIONS = """Return exactly one action:
 {"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"","metric_value":null,"artifact_paths":[]}
 {"action":"rotate_context","reason":"...","next_action":"..."}
 {"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
+Prefer edit over rewriting an existing file. Prefer batch for independent reads, inspections, and small edits. Prefer one focused bash script over many tiny shell turns.
+Batch children execute sequentially. Never use batch to launch multiple long jobs under the assumption that they run in parallel; start each long job as a separate background bash action and poll it.
+When a known check is needed after a mutation, default to one batch containing the edit/write followed by the focused bash check so both happen in one model turn.
+Keep bash actions short and auditable. For Python logic longer than a few lines, write a named helper script and execute it instead of embedding a large python heredoc or python -c program; this gives syntax-check evidence, preserves reusable instrumentation, and avoids shell/JSON quoting failures.
+Do not reread the same file or repeat the same inspection at an unchanged workspace revision unless the previous observation was truncated and you request a specific unseen range.
+After writing or editing a file, run a focused executable check before changing that same file again. Use the check output to make the next change; do not perform consecutive speculative rewrites.
+For optimization tasks, write experiments to candidate paths. Independently score each candidate and promote it to a required deliverable path only if it improves the recorded best; never let a losing experiment overwrite the best artifact. Microbenchmark a small iteration count before launching a long search.
+Work only on the active work item. Do not implement a downstream work item early. As soon as the active item's implementation appears to satisfy its acceptance criteria, the next action must be begin_verification.
+After begin_verification, the controller runs the exact verification commands automatically. Do not run them repeatedly.
 Do not accept an item without current-revision observational evidence. Use begin_verification before acceptance."""
+
+LONG_HORIZON_ACTIONS = """Return exactly one action:
+{"action":"bash","command":"...","cwd":".","timeout_seconds":1800,"background":false,"rationale":"..."}
+{"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
+{"action":"write","path":"...","content":"...","rationale":"..."}
+{"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
+{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"bash","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
+{"action":"poll","command_id":"cmd-..."}
+{"action":"terminate","command_id":"cmd-..."}
+{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"","metric_value":null,"artifact_paths":[]}
+{"action":"rotate_context","reason":"...","next_action":"..."}
+{"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
+{"action":"begin_final_verification","rationale":"all required deliverables are ready for a clean final check"}
+There is no controller-managed work-item plan in long-horizon mode. Keep decomposition advisory and freely change strategy from observations; never wait for an artificial milestone before working on another part of the objective.
+Create a valid scoreable baseline for every required deliverable early. Then allocate effort by measured correctness or metric gain per wall-clock time.
+Treat required deliverable paths as promoted best-so-far artifacts. Run experiments on candidate paths, independently score them, and atomically promote only verified improvements. Checkpoint all currently valid required deliverables together after a material improvement.
+Batch children execute sequentially. Start independent long jobs as separate background bash actions and poll them. Microbenchmark before a long search and leave time for final verification.
+Prefer edit over rewriting an existing file. Keep bash actions short and auditable. Put nontrivial Python logic in a named helper file rather than a heredoc or large python -c command.
+Do not reread unchanged files or repeat failed experiments without a materially different hypothesis. Use rotate_context for a compact handoff when history grows.
+Use begin_final_verification only after running relevant checks and confirming required artifacts exist. The controller also enters final verification automatically near the deadline."""
 
 FINAL_VERIFY_ACTIONS = """Run final integration checks with bash/read, or return:
 {"action":"final_verified","evidence_ids":["ev-..."],"summary":"why all mandatory outcomes and regressions pass","risks":["..."]}
@@ -169,8 +206,15 @@ class RunController:
             return self._model_step(
                 state, PLAN_ACTIONS, "plan-work", self._playbook(state)
             )
-        if state.phase in {"standard_work", "long_horizon_work"}:
+        if state.phase == "standard_work":
             return self._work_step(state)
+        if state.phase == "long_horizon_work":
+            return self._model_step(
+                state,
+                LONG_HORIZON_ACTIONS,
+                "long-horizon",
+                self._playbook(state),
+            )
         if state.phase == "final_verify":
             return self._model_step(
                 state, FINAL_VERIFY_ACTIONS, "finalize-delivery", self._playbook(state)
@@ -223,11 +267,28 @@ class RunController:
             return self._commit(state)
 
         if active.status == "verifying":
+            unobserved = self._unobserved_verification_commands(active)
+            if unobserved:
+                for command in unobserved:
+                    self._execute_tool(
+                        state,
+                        {
+                            "action": "bash",
+                            "command": command,
+                            "cwd": ".",
+                            "timeout_seconds": 1_800,
+                            "background": False,
+                            "rationale": "controller-managed acceptance verification",
+                        },
+                    )
+                self.store.append_event(
+                    "verification_commands_executed",
+                    {"work_item_id": active.id, "commands": unobserved},
+                )
+                return self._commit(state)
             skill = "verify-work-item"
         elif active.failure_signatures:
             skill = "diagnose-and-replan"
-        elif state.phase == "long_horizon_work":
-            skill = "long-horizon"
         else:
             skill = "execute-work-item"
         return self._model_step(state, WORK_ACTIONS, skill, active.playbook)
@@ -294,21 +355,32 @@ class RunController:
         )
         if name == "profile_task" and state.phase == "recon":
             state.profile = TaskProfile.from_dict(self._mapping(action, "profile"))
+            # Optimization runs must preserve and compare the best known artifact.
+            # Treat this as a controller invariant instead of trusting a model field:
+            # a false value here can let a later losing candidate replace the best
+            # deliverable, which is especially damaging in long-running benchmarks.
+            if state.profile.primary_playbook == "optimization":
+                state.profile.requires_best_artifact = True
             if "standard-only" in state.runtime_config.get("ablations", []):
                 state.profile.execution_regime = "standard"
                 state.profile.rationale += " [ablation: standard-only]"
-            state.phase = "plan"
+            if state.profile.execution_regime == "long_horizon":
+                state.phase = "long_horizon_work"
+                state.work_items = []
+                state.active_work_item_id = None
+                self.store.append_event(
+                    "flat_long_horizon_started",
+                    {"primary_playbook": state.profile.primary_playbook},
+                )
+            else:
+                state.phase = "plan"
             return
         if name == "set_plan" and state.phase == "plan":
             items = self._parse_plan(action.get("work_items"))
             state.work_items = items
-            state.phase = (
-                "long_horizon_work"
-                if state.profile and state.profile.execution_regime == "long_horizon"
-                else "standard_work"
-            )
+            state.phase = "standard_work"
             return
-        if name in {"bash", "read", "write", "poll", "terminate"}:
+        if name in {"bash", "read", "write", "edit", "poll", "terminate"}:
             if state.phase not in {
                 "standard_work",
                 "long_horizon_work",
@@ -317,17 +389,51 @@ class RunController:
                 raise ValueError(f"tool action not allowed in {state.phase}")
             self._execute_tool(state, action)
             return
-        if name == "begin_verification" and state.phase in {
+        if name == "batch" and state.phase in {
             "standard_work",
             "long_horizon_work",
+            "final_verify",
         }:
+            actions = action.get("actions", action.get("batched_actions"))
+            if not isinstance(actions, list) or not actions or len(actions) > 8:
+                raise ValueError("batch requires between 1 and 8 actions")
+            allowed = {"bash", "read", "write", "edit"}
+            for child in actions:
+                if not isinstance(child, dict) or child.get("action") not in allowed:
+                    raise ValueError(
+                        "batch only supports bash, read, write, and edit actions"
+                    )
+                if child.get("action") == "bash" and child.get("background"):
+                    raise ValueError("background bash is not allowed inside batch")
+            rejected_children: list[str] = []
+            executed_children = 0
+            for child in actions:
+                try:
+                    self._execute_tool(state, child)
+                    executed_children += 1
+                except ValueError as error:
+                    rejected_children.append(str(error))
+                    self.store.append_event(
+                        "batch_child_rejected",
+                        {"action": child.get("action"), "error": str(error)},
+                    )
+            if rejected_children:
+                feedback = "Controller skipped rejected batch children: " + "; ".join(
+                    rejected_children
+                )
+                self.store.append_transcript(
+                    "user", feedback, kind="controller_feedback"
+                )
+            if executed_children == 0:
+                raise ValueError(
+                    "all batch actions were rejected: " + "; ".join(rejected_children)
+                )
+            return
+        if name == "begin_verification" and state.phase == "standard_work":
             item = self._active(state)
             item.status = "verifying"
             return
-        if name == "accept_work_item" and state.phase in {
-            "standard_work",
-            "long_horizon_work",
-        }:
+        if name == "accept_work_item" and state.phase == "standard_work":
             item = self._active(state)
             if item.status != "verifying":
                 raise ValueError("begin_verification is required before acceptance")
@@ -340,24 +446,13 @@ class RunController:
             self.store.append_event(
                 "work_item_accepted", {"work_item_id": item.id, "evidence_ids": ids}
             )
-            if (
-                state.phase == "long_horizon_work"
-                and "no-checkpoints" not in state.runtime_config.get("ablations", [])
-            ):
-                self._checkpoint(
-                    state,
-                    {"restore_notes": str(action.get("summary", "accepted milestone"))},
-                )
             self.context.rotate(
                 state,
                 reason="milestone_finished",
                 next_action="select next ready work item",
             )
             return
-        if name == "reject_work_item" and state.phase in {
-            "standard_work",
-            "long_horizon_work",
-        }:
+        if name == "reject_work_item" and state.phase == "standard_work":
             item = self._active(state)
             signature = str(action.get("failure_signature", "")).strip()
             strategy = str(action.get("next_strategy", "")).strip()
@@ -377,11 +472,9 @@ class RunController:
                 {"work_item_id": item.id, "next_strategy": strategy},
             )
             return
-        if name == "revise_plan" and state.phase in {
-            "standard_work",
-            "long_horizon_work",
-        }:
-            self._revise_plan(state, self._parse_plan(action.get("work_items")))
+        if name == "revise_plan" and state.phase == "standard_work":
+            proposed = self._parse_plan(action.get("work_items"))
+            self._revise_plan(state, proposed)
             return
         if name == "checkpoint" and state.phase in {
             "standard_work",
@@ -396,10 +489,25 @@ class RunController:
                 next_action=str(action.get("next_action", "")),
             )
             return
+        if name == "begin_final_verification" and state.phase == "long_horizon_work":
+            state.phase = "final_verify"
+            state.active_work_item_id = None
+            state.final["verification_started_at"] = utc_now()
+            self.store.append_event(
+                "phase_changed", {"phase": state.phase, "reason": "agent_ready"}
+            )
+            return
         if name == "wait" and state.phase in {"standard_work", "long_horizon_work"}:
             reason = str(action.get("reason", "")).strip()
             if not reason:
                 raise ValueError("wait requires a specific external event")
+            if not any(
+                command.get("status") == "running"
+                for command in self.commands.recover()
+            ):
+                raise ValueError(
+                    "wait requires a running background command; tool results are already synchronous"
+                )
             state.status = "waiting"
             self.store.append_event(
                 "run_waiting",
@@ -408,7 +516,11 @@ class RunController:
             return
         if name == "final_verified" and state.phase == "final_verify":
             hardening = bool(state.final.get("deadline_hardening"))
-            if not state.mandatory_complete() and not hardening:
+            flat_long_horizon = bool(
+                state.profile
+                and state.profile.execution_regime == "long_horizon"
+            )
+            if not state.mandatory_complete() and not hardening and not flat_long_horizon:
                 raise ValueError("mandatory work is incomplete")
             ids = self._evidence_ids(action)
             self._validate_evidence(
@@ -421,7 +533,8 @@ class RunController:
                 "summary": str(action.get("summary", "")),
                 "risks": list(action.get("risks", [])),
                 "workspace_revision": self.tools.workspace_revision(),
-                "partial": not state.mandatory_complete(),
+                "partial": hardening
+                or (not flat_long_horizon and not state.mandatory_complete()),
             }
             state.phase = "deliver"
             return
@@ -444,6 +557,9 @@ class RunController:
 
     def _execute_tool(self, state: RunState, action: dict[str, Any]) -> None:
         name = str(action["action"])
+        self._validate_tool_action(action)
+        if name in {"write", "edit"}:
+            self._require_mutation_feedback(state, str(action.get("path", "")))
         if name == "bash":
             result = self.commands.run(
                 str(action.get("command", "")),
@@ -452,6 +568,7 @@ class RunController:
                 background=bool(action.get("background", False)),
             )
         elif name == "read":
+            self._require_new_read_range(state, action)
             result = self.tools.read(
                 str(action.get("path", "")),
                 start_line=int(action.get("start_line", 1)),
@@ -460,6 +577,13 @@ class RunController:
         elif name == "write":
             result = self.tools.write(
                 str(action.get("path", "")), str(action.get("content", ""))
+            )
+        elif name == "edit":
+            result = self.tools.edit(
+                str(action.get("path", "")),
+                str(action.get("old", "")),
+                str(action.get("new", "")),
+                replace_all=bool(action.get("replace_all", False)),
             )
         elif name == "poll":
             result = self.commands.poll(str(action.get("command_id", "")))
@@ -474,6 +598,34 @@ class RunController:
         self.store.append_event(
             "tool_result", {"evidence_id": evidence.id, **result.to_dict()}
         )
+        if name in {"write", "edit"} and result.success:
+            automatic_command = self._automatic_mutation_check(
+                str(action.get("path", ""))
+            )
+            if automatic_command:
+                check_action = {
+                    "action": "bash",
+                    "command": automatic_command,
+                    "cwd": ".",
+                    "timeout_seconds": 60,
+                    "background": False,
+                    "rationale": "controller automatic post-mutation syntax check",
+                }
+                check_result = self.commands.run(
+                    automatic_command,
+                    cwd=".",
+                    timeout_seconds=60,
+                    background=False,
+                )
+                check_evidence = self._tool_evidence(state, check_result, check_action)
+                self.store.record_evidence(check_evidence)
+                state.evidence_ids.append(check_evidence.id)
+                if active:
+                    active.evidence_ids.append(check_evidence.id)
+                self.store.append_event(
+                    "automatic_mutation_check",
+                    {"evidence_id": check_evidence.id, **check_result.to_dict()},
+                )
 
     def _tool_evidence(
         self, state: RunState, result: ToolResult, action: dict[str, Any]
@@ -484,20 +636,119 @@ class RunController:
             kind = "observation"
         else:
             kind = "mutation"
+        summary_limit = 16_000 if result.tool == "read" else 4_000
+        action_path = str(action.get("path", ""))
         return Evidence(
             id=new_id("ev"),
             kind=kind,
             created_at=utc_now(),
             work_item_id=state.active_work_item_id,
             workspace_revision=self.tools.workspace_revision(),
-            summary=result.output[:1_000],
+            summary=result.output[:summary_limit],
             command=str(action.get("command", "")),
             cwd=str(action.get("cwd", ".")),
             exit_code=result.exit_code,
             duration_seconds=result.duration_seconds,
             raw_log=result.raw_log,
-            data={"success": result.success, **result.data},
+            data={
+                "success": result.success,
+                "affected_paths": result.affected_paths,
+                "path": self._relative_action_path(action_path) if action_path else "",
+                "start_line": int(action.get("start_line", 1)),
+                "max_lines": int(action.get("max_lines", 400)),
+                "model_call": state.counters.get("model_calls", 0),
+                **result.data,
+            },
         )
+
+    def _require_mutation_feedback(self, state: RunState, path: str) -> None:
+        """Require an executable feedback step between mutations to one file."""
+        active = state.work_item(state.active_work_item_id)
+        if active is None or not path:
+            return
+        path = self._relative_action_path(path)
+        evidence = self.store.evidence_by_id(active.evidence_ids)
+        latest_mutation_index: int | None = None
+        for index in range(len(evidence) - 1, -1, -1):
+            item = evidence[index]
+            if item.kind != "mutation" or item.data.get("success") is not True:
+                continue
+            if path in item.data.get("affected_paths", []):
+                latest_mutation_index = index
+                break
+        if latest_mutation_index is None:
+            return
+        if any(item.kind == "command" for item in evidence[latest_mutation_index + 1 :]):
+            return
+        raise ValueError(
+            f"run a focused bash check after the previous mutation to {path!r} "
+            "before changing that file again"
+        )
+
+    def _require_new_read_range(
+        self, state: RunState, action: dict[str, Any]
+    ) -> None:
+        """Reject duplicate reads while allowing a targeted unseen continuation."""
+        active = state.work_item(state.active_work_item_id)
+        raw_path = str(action.get("path", ""))
+        if active is None or not raw_path:
+            return
+        path = self._relative_action_path(raw_path)
+        revision = self.tools.workspace_revision()
+        start_line = int(action.get("start_line", 1))
+        evidence = self.store.evidence_by_id(active.evidence_ids)
+        for item in reversed(evidence):
+            if (
+                item.kind != "observation"
+                or item.data.get("success") is not True
+                or item.workspace_revision != revision
+                or item.data.get("path") != path
+            ):
+                continue
+            previous_start = int(item.data.get("start_line", 1))
+            previous_max = int(item.data.get("max_lines", 400))
+            if "... truncated;" not in item.summary:
+                raise ValueError(
+                    f"{path!r} was already read completely at this workspace revision; "
+                    "use the existing observation"
+                )
+            first_unseen = previous_start + previous_max
+            if start_line < first_unseen:
+                raise ValueError(
+                    f"read of {path!r} overlaps an existing observation; continue at "
+                    f"start_line {first_unseen} or later"
+                )
+            return
+
+    def _relative_action_path(self, path: str) -> str:
+        try:
+            return str(self.tools.resolve_path(path).relative_to(self.tools.workspace))
+        except (OSError, ValueError):
+            return path
+
+    def _automatic_mutation_check(self, path: str) -> str:
+        relative = self._relative_action_path(path)
+        if Path(relative).suffix == ".py":
+            return f"python3 -m py_compile {shlex.quote(relative)}"
+        if Path(relative).suffix in {".sh", ".bash"}:
+            return f"bash -n {shlex.quote(relative)}"
+        return ""
+
+    @staticmethod
+    def _validate_tool_action(action: dict[str, Any]) -> None:
+        name = str(action.get("action", ""))
+        if name == "bash" and not isinstance(action.get("command"), str):
+            raise ValueError("bash requires a string command")
+        if name == "read" and not isinstance(action.get("path"), str):
+            raise ValueError("read requires a string path")
+        if name == "write" and not isinstance(action.get("content"), str):
+            raise ValueError("write requires an explicit string content field")
+        if name == "write" and not isinstance(action.get("path"), str):
+            raise ValueError("write requires a string path")
+        if name == "edit" and not all(
+            isinstance(action.get(key), str) for key in ("path", "old", "new")
+        ):
+            raise ValueError("edit requires string path, old, and new fields")
 
     def _validate_evidence(
         self,
@@ -508,12 +759,15 @@ class RunController:
     ) -> None:
         if not ids:
             raise ValueError("at least one evidence id is required")
-        evidence = self.store.evidence_by_id(ids)
-        if len(evidence) != len(set(ids)):
+        requested_evidence = self.store.evidence_by_id(ids)
+        if len(requested_evidence) != len(set(ids)):
             raise ValueError("one or more evidence ids do not exist")
         revision = self.tools.workspace_revision()
-        if any(item.workspace_revision != revision for item in evidence):
-            raise ValueError("evidence does not match the current workspace revision")
+        evidence = [
+            item for item in requested_evidence if item.workspace_revision == revision
+        ]
+        if not evidence:
+            raise ValueError("no evidence matches the current workspace revision")
         if not any(
             item.data.get("success") is True
             and (
@@ -556,6 +810,20 @@ class RunController:
             raise ValueError(
                 f"work item verification commands lack passing evidence: {missing}"
             )
+
+    def _unobserved_verification_commands(self, item: WorkItem) -> list[str]:
+        revision = self.tools.workspace_revision()
+        observed = {
+            evidence.command
+            for evidence in self.store.evidence_by_id(item.evidence_ids)
+            if evidence.kind == "command"
+            and evidence.workspace_revision == revision
+        }
+        return [
+            command
+            for command in item.verification_commands
+            if command not in observed
+        ]
 
     def _checkpoint(self, state: RunState, action: dict[str, Any]) -> None:
         checkpoint_id = new_id("checkpoint")
@@ -628,6 +896,7 @@ class RunController:
         elapsed = max(0.0, time.time() - started.timestamp())
         state.counters["elapsed_seconds"] = int(elapsed)
         if elapsed >= limit:
+            self._restore_best_checkpoint_at_deadline(state)
             state.status = "paused_limit"
             state.final["limit"] = {"elapsed_seconds": elapsed, "reached_at": utc_now()}
             self.store.append_event("hard_deadline_reached", state.final["limit"])
@@ -654,6 +923,40 @@ class RunController:
             )
             return True
         return False
+
+    def _restore_best_checkpoint_at_deadline(self, state: RunState) -> None:
+        """Prevent unfinished optimization work from replacing accepted artifacts."""
+        if (
+            not state.profile
+            or state.profile.primary_playbook != "optimization"
+            or not state.profile.requires_best_artifact
+            or not state.best_checkpoint_id
+        ):
+            return
+        checkpoint_path = (
+            self.store.checkpoints_dir / f"{state.best_checkpoint_id}.json"
+        )
+        if not checkpoint_path.is_file():
+            return
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            restored = self.tools.restore_checkpoint_snapshot(
+                str(checkpoint.get("snapshot_path", ""))
+            )
+        except (OSError, ValueError, tarfile.TarError) as error:
+            self.store.append_event(
+                "best_checkpoint_restore_failed",
+                {"checkpoint_id": state.best_checkpoint_id, "error": str(error)},
+            )
+            return
+        self.store.append_event(
+            "best_checkpoint_restored",
+            {
+                "checkpoint_id": state.best_checkpoint_id,
+                "restored_files": restored,
+                "workspace_revision": self.tools.workspace_revision(),
+            },
+        )
 
     def _commit(self, state: RunState) -> RunState:
         return self.store.commit(state, expected_revision=state.revision)

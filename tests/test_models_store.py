@@ -29,6 +29,43 @@ def test_ready_selection_respects_dependencies(tmp_path: Path) -> None:
     assert state.next_ready_item().id == "B"  # type: ignore[union-attr]
 
 
+def test_work_item_normalizes_playbook_names_used_as_kinds() -> None:
+    item = WorkItem.from_dict(
+        {
+            "id": "W1",
+            "title": "Optimize",
+            "description": "Improve a measured score",
+            "kind": "optimization",
+            "playbook": "optimization",
+            "verification_commands": ["true"],
+        }
+    )
+    assert item.kind == "experiment"
+    assert item.playbook == "optimization"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("verification", "generalist"),
+        ("experiment", "optimization"),
+        ("integration", "project"),
+    ],
+)
+def test_work_item_normalizes_work_kinds_used_as_playbooks(
+    raw: str, expected: str
+) -> None:
+    item = WorkItem.from_dict(
+        {
+            "id": "W1",
+            "title": "Milestone",
+            "description": "Complete a milestone",
+            "playbook": raw,
+        }
+    )
+    assert item.playbook == expected
+
+
 def test_state_store_uses_optimistic_revisions(tmp_path: Path) -> None:
     state = RunState.create("persistent", tmp_path / "workspace")
     (tmp_path / "workspace").mkdir()

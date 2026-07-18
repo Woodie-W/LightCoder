@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
+import json
 from typing import Any
 
 from .store import StateStore
@@ -15,6 +16,24 @@ def build_run_report(store: StateStore) -> dict[str, Any]:
     mandatory = [item for item in state.work_items if item.mandatory]
     created = datetime.fromisoformat(state.created_at)
     updated = datetime.fromisoformat(state.updated_at)
+    usage: Counter[str] = Counter()
+    successful_model_responses = 0
+    if store.transcript_path.is_file():
+        for line in store.transcript_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            metadata = value.get("metadata", {})
+            response_usage = metadata.get("usage", {})
+            if value.get("role") != "assistant" or not isinstance(response_usage, dict):
+                continue
+            successful_model_responses += 1
+            for key, amount in response_usage.items():
+                if isinstance(amount, int):
+                    usage[str(key)] += amount
     return {
         "schema_version": 1,
         "run_id": state.run_id,
@@ -23,10 +42,15 @@ def build_run_report(store: StateStore) -> dict[str, Any]:
         "objective": state.objective,
         "execution_regime": state.profile.execution_regime if state.profile else None,
         "primary_playbook": state.profile.primary_playbook if state.profile else None,
+        "control_mode": "flat"
+        if state.profile and state.profile.execution_regime == "long_horizon"
+        else "work_graph",
         "ablations": state.runtime_config.get("ablations", []),
         "elapsed_seconds": max(0.0, (updated - created).total_seconds()),
         "configured_wall_time_seconds": state.deadline.wall_time_seconds,
         "model_calls": state.counters.get("model_calls", 0),
+        "successful_model_responses": successful_model_responses,
+        "token_usage": dict(sorted(usage.items())),
         "invalid_actions": state.counters.get("invalid_actions", 0),
         "context_episodes": len(state.episodes),
         "context_rotations": max(0, len(state.episodes) - 1),

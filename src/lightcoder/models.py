@@ -81,6 +81,22 @@ VALID_RUN_STATUSES = {
     "cancelled",
 }
 
+PLAYBOOK_ALIASES = {
+    # Models occasionally use work-item kinds where a playbook is expected.
+    "capability": "generalist",
+    "experiment": "optimization",
+    "hardening": "generalist",
+    "integration": "project",
+    "test": "generalist",
+    "testing": "generalist",
+    "verification": "generalist",
+}
+
+
+def normalize_playbook(value: Any) -> str:
+    raw = str(value or "generalist")
+    return PLAYBOOK_ALIASES.get(raw, raw)
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -108,7 +124,7 @@ class TaskProfile:
     def from_dict(cls, value: dict[str, Any]) -> "TaskProfile":
         profile = cls(
             execution_regime=str(value.get("execution_regime", "standard")),  # type: ignore[arg-type]
-            primary_playbook=str(value.get("primary_playbook", "generalist")),  # type: ignore[arg-type]
+            primary_playbook=normalize_playbook(value.get("primary_playbook")),  # type: ignore[arg-type]
             estimated_horizon=str(value.get("estimated_horizon", "short")),
             validation_cost=str(value.get("validation_cost", "low")),
             supports_partial_progress=bool(
@@ -155,12 +171,23 @@ class WorkItem:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "WorkItem":
+        raw_kind = str(value.get("kind", "capability"))
+        kind_aliases = {
+            "generalist": "capability",
+            "feature": "capability",
+            "optimization": "experiment",
+            "project": "integration",
+            "repair": "capability",
+            "test": "verification",
+            "testing": "verification",
+            "transformation": "capability",
+        }
         item = cls(
             id=str(value.get("id") or new_id("work")),
             title=str(value.get("title", "")).strip(),
             description=str(value.get("description", "")).strip(),
-            kind=str(value.get("kind", "capability")),
-            playbook=str(value.get("playbook", "generalist")),  # type: ignore[arg-type]
+            kind=kind_aliases.get(raw_kind, raw_kind),
+            playbook=normalize_playbook(value.get("playbook")),  # type: ignore[arg-type]
             status=str(value.get("status", "pending")),  # type: ignore[arg-type]
             dependencies=[str(x) for x in value.get("dependencies", [])],
             mandatory=bool(value.get("mandatory", True)),

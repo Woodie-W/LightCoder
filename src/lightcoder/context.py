@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from typing import Any
 
@@ -28,7 +29,7 @@ class ContextManager:
         *,
         context_window_tokens: int = 128_000,
         rotate_fraction: float = 0.72,
-        transcript_tail: int = 12,
+        transcript_tail: int = 512,
         handoffs_enabled: bool = True,
     ) -> None:
         self.store = store
@@ -47,21 +48,31 @@ class ContextManager:
         core_skill: str | None = None,
         playbook: str | None = None,
     ) -> list[ChatMessage]:
-        sections = [self._durable_state(state), f"ALLOWED ACTIONS\n{action_contract}"]
+        # Keep task-static material in the system prefix and append the episode
+        # transcript chronologically. DeepSeek's cache is prefix based: rebuilding
+        # the latest state before history turns every cycle into a cache miss.
+        system_sections = [
+            SYSTEM_CONTRACT,
+            f"TASK OBJECTIVE\n{state.objective}",
+            f"ALLOWED ACTIONS\n{action_contract}",
+        ]
         if core_skill:
-            sections.append(f"CORE SKILL: {core_skill}\n{self.skills.load(core_skill)}")
+            system_sections.append(
+                f"CORE SKILL: {core_skill}\n{self.skills.load(core_skill)}"
+            )
         if playbook and playbook in {item.name for item in self.skills.metadata()}:
-            sections.append(f"PLAYBOOK: {playbook}\n{self.skills.load(playbook)}")
+            system_sections.append(
+                f"PLAYBOOK: {playbook}\n{self.skills.load(playbook)}"
+            )
         handoff = self.latest_handoff(state)
         if handoff:
-            sections.append(
+            system_sections.append(
                 f"LATEST VALIDATED HANDOFF\n{json.dumps(handoff, ensure_ascii=False, indent=2)}"
             )
-        messages = [
-            ChatMessage("system", SYSTEM_CONTRACT),
-            ChatMessage("user", "\n\n".join(sections)),
-        ]
+        current_sections = [self._durable_state(state)]
+        messages = [ChatMessage("system", "\n\n".join(system_sections))]
         messages.extend(self._recent_transcript(state))
+        messages.append(ChatMessage("user", "\n\n".join(current_sections)))
         return messages
 
     def estimate_tokens(self, messages: list[ChatMessage]) -> int:
@@ -83,16 +94,22 @@ class ContextManager:
             "run_id": state.run_id,
             "generation": len(state.episodes),
             "created_at": utc_now(),
-            "objective": state.objective,
             "phase": state.phase,
+            "control_mode": "flat"
+            if state.profile and state.profile.execution_regime == "long_horizon"
+            else "work_graph",
             "profile": asdict(state.profile) if state.profile else None,
             "workspace_revision": revision,
             "changed_files": self.tools.changed_files(),
-            "active_work_item": asdict(state.work_item(state.active_work_item_id))
+            "active_work_item": self._compact_work_item(
+                state.work_item(state.active_work_item_id), evidence_limit=8
+            )
             if state.work_item(state.active_work_item_id)
             else None,
             "accepted_work_items": [
-                asdict(item) for item in state.work_items if item.status == "accepted"
+                self._compact_work_item(item, evidence_limit=5)
+                for item in state.work_items
+                if item.status == "accepted"
             ],
             "best_checkpoint_id": state.best_checkpoint_id,
             "recent_evidence_ids": state.evidence_ids[-20:],
@@ -152,25 +169,62 @@ class ContextManager:
 
     def _durable_state(self, state: RunState) -> str:
         active = state.work_item(state.active_work_item_id)
-        recent_evidence = self.store.evidence()[-12:]
+        # This message is appended to the provider conversation every cycle. Keep
+        # it small: the objective and action contract already live in the stable
+        # system prefix, and future work-item details become available when that
+        # item is selected. Repeating the whole state here causes quadratic prompt
+        # growth even when prefix caching makes those tokens cheaper.
+        all_evidence = self.store.evidence()
+        latest_model_call = max(
+            (
+                int(item.data["model_call"])
+                for item in all_evidence
+                if item.data.get("model_call") is not None
+            ),
+            default=None,
+        )
+        # Keep the ordinary five-item tail, plus every child result from the
+        # newest model action. A batch may contain up to eight children, and the
+        # state's model-call counter can already be one step ahead while the
+        # action is being resumed, so comparing against the counter is brittle.
+        recent_ids = {item.id for item in all_evidence[-5:]}
+        if latest_model_call is not None:
+            recent_ids.update(
+                item.id
+                for item in all_evidence
+                if item.data.get("model_call") == latest_model_call
+            )
+        recent_evidence = [item for item in all_evidence if item.id in recent_ids]
         compact = {
             "run_id": state.run_id,
-            "objective": state.objective,
             "phase": state.phase,
             "status": state.status,
-            "profile": asdict(state.profile) if state.profile else None,
-            "active_work_item": asdict(active) if active else None,
-            "work_items": [
+            "control_mode": "flat"
+            if state.profile and state.profile.execution_regime == "long_horizon"
+            else "work_graph",
+            "counters": {
+                "elapsed_seconds": state.counters.get("elapsed_seconds", 0),
+                "model_calls": state.counters.get("model_calls", 0),
+                "invalid_actions": state.counters.get("invalid_actions", 0),
+            },
+            "profile": {
+                "execution_regime": state.profile.execution_regime,
+                "primary_playbook": state.profile.primary_playbook,
+                "validation_cost": state.profile.validation_cost,
+                "requires_best_artifact": state.profile.requires_best_artifact,
+            }
+            if state.profile
+            else None,
+            "active_work_item": self._compact_work_item(active, evidence_limit=8)
+            if active
+            else None,
+            "work_item_statuses": [
                 {
                     "id": item.id,
                     "title": item.title,
                     "status": item.status,
                     "dependencies": item.dependencies,
                     "mandatory": item.mandatory,
-                    "acceptance": item.acceptance,
-                    "evidence_ids": item.evidence_ids[-5:],
-                    "verification_commands": item.verification_commands,
-                    "failure_signatures": item.failure_signatures[-3:],
                 }
                 for item in state.work_items
             ],
@@ -182,19 +236,119 @@ class ContextManager:
                     "kind": item.kind,
                     "work_item_id": item.work_item_id,
                     "workspace_revision": item.workspace_revision,
-                    "summary": item.summary,
-                    "command": item.command,
+                    # Preserve the newest tool result once so the next model turn
+                    # can actually use a file read or diagnostic output. Older
+                    # evidence remains compact and cacheable.
+                    "summary": item.summary[: (
+                        16_000
+                        if (
+                            index == len(recent_evidence) - 1
+                            or item.data.get("model_call") == latest_model_call
+                        )
+                        else 700
+                    )],
+                    "command": item.command[:700],
                     "exit_code": item.exit_code,
                     "duration_seconds": item.duration_seconds,
                     "raw_log": item.raw_log,
-                    "data": item.data,
+                    "success": item.data.get("success"),
                 }
-                for item in recent_evidence
+                for index, item in enumerate(recent_evidence)
             ],
         }
         return "CANONICAL RUN STATE\n" + json.dumps(
             compact, ensure_ascii=False, indent=2
         )
+
+    @staticmethod
+    def _compact_work_item(item: Any, *, evidence_limit: int = 5) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "title": item.title,
+            "description": item.description,
+            "kind": item.kind,
+            "playbook": item.playbook,
+            "status": item.status,
+            "dependencies": item.dependencies,
+            "mandatory": item.mandatory,
+            "acceptance": item.acceptance,
+            "verification_commands": item.verification_commands,
+            "evidence_ids": item.evidence_ids[-evidence_limit:],
+            "failure_signatures": item.failure_signatures[-3:],
+            "attempt_count": item.attempt_count,
+        }
+
+    @staticmethod
+    def _compact_transcript_content(role: str, content: str) -> str:
+        if role == "assistant":
+            try:
+                action = json.loads(content)
+            except json.JSONDecodeError:
+                action = None
+            if isinstance(action, dict) and isinstance(action.get("action"), str):
+                compact: dict[str, Any] = {
+                    "type": action["action"],
+                    "rationale": str(action.get("rationale", ""))[:500],
+                }
+                for key in (
+                    "path",
+                    "cwd",
+                    "command_id",
+                    "evidence_ids",
+                    "summary",
+                    "failure_signature",
+                    "next_strategy",
+                ):
+                    if key in action:
+                        value = action[key]
+                        compact[key] = value[:1_000] if isinstance(value, str) else value
+                if "command" in action:
+                    command = str(action["command"])
+                    compact["command"] = command[:1_500]
+                    if len(command) > 1_500:
+                        compact["command_omitted_chars"] = len(command) - 1_500
+                if "content" in action:
+                    compact["content_omitted_chars"] = len(str(action["content"]))
+                for key in ("old", "new"):
+                    if key in action:
+                        compact[f"{key}_omitted_chars"] = len(str(action[key]))
+                if action["action"] == "set_plan":
+                    compact["work_item_ids"] = [
+                        str(item.get("id", ""))
+                        for item in action.get("work_items", [])
+                        if isinstance(item, dict)
+                    ]
+                if action["action"] == "batch":
+                    compact["children"] = [
+                        {"type": str(item.get("action", ""))}
+                        for item in action.get("actions", [])
+                        if isinstance(item, dict)
+                    ]
+                return (
+                    "COMPLETED ACTION HISTORY — not a current executable action\n"
+                    + json.dumps(compact, ensure_ascii=False)
+                )
+            shell_blocks = [
+                block.strip()
+                for block in re.findall(
+                    r"```(?:bash|sh|shell)\s*\n(.*?)```",
+                    content,
+                    flags=re.I | re.S,
+                )
+                if block.strip()
+            ]
+            if shell_blocks:
+                command = "\n".join(shell_blocks)
+                compact = {"type": "bash", "command": command[:1_500]}
+                if len(command) > 1_500:
+                    compact["command_omitted_chars"] = len(command) - 1_500
+                return (
+                    "COMPLETED SHELL ACTION HISTORY — not a current executable action\n"
+                    + json.dumps(compact, ensure_ascii=False)
+                )
+        if len(content) <= 3_000:
+            return content
+        return f"{content[:2_400]}\n... {len(content) - 2_800} characters omitted ...\n{content[-400:]}"
 
     def _recent_transcript(self, state: RunState) -> list[ChatMessage]:
         path = self.store.transcript_path
@@ -209,11 +363,14 @@ class ContextManager:
                 value = json.loads(line)
                 role = value.get("role")
                 metadata = value.get("metadata", {})
-                if (
-                    role in {"user", "assistant"}
-                    and metadata.get("kind") != "controller_context"
-                ):
-                    messages.append(ChatMessage(role, str(value.get("content", ""))))
+                if role in {"user", "assistant"}:
+                    raw_content = str(value.get("content", ""))
+                    content = (
+                        raw_content
+                        if metadata.get("kind") == "controller_context"
+                        else self._compact_transcript_content(role, raw_content)
+                    )
+                    messages.append(ChatMessage(role, content))
                     if len(messages) >= self.transcript_tail:
                         break
             except json.JSONDecodeError:
