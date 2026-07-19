@@ -97,6 +97,43 @@ def test_optimization_profile_always_requires_best_artifact(
     assert state.profile.requires_best_artifact is True
 
 
+def test_profile_aliases_route_long_horizon_tasks_without_plan_fallback() -> None:
+    normalized = RunController._normalize_profile(
+        {
+            "profile": "optimization",
+            "horizon": "long_horizon",
+            "rationale": "multi-hour measured search",
+        }
+    )
+    assert normalized["execution_regime"] == "long_horizon"
+    assert normalized["primary_playbook"] == "optimization"
+    assert normalized["estimated_horizon"] == "multi_hour"
+
+
+def test_rejected_native_tool_call_gets_a_tool_response(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "native protocol recovery",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    controller._record_rejected_tool_call(
+        state,
+        {"action": "unknown_tool", "_tool_call_id": "call_bad"},
+        "tool is unavailable",
+    )
+    message = json.loads(controller.store.transcript_path.read_text().splitlines()[-1])
+    assert message["role"] == "tool"
+    assert message["metadata"]["tool_call_id"] == "call_bad"
+    assert json.loads(message["content"])["success"] is False
+
+
 def test_long_horizon_bypasses_plan_generation(
     tmp_path: Path, skills_root: Path
 ) -> None:

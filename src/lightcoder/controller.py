@@ -414,6 +414,8 @@ class RunController:
                 state, reason="context_threshold", next_action="continue current phase"
             )
             return self._commit(state)
+        current_action: dict[str, Any] | None = None
+        remaining_actions: list[dict[str, Any]] = []
         try:
             state.counters["model_calls"] = state.counters.get("model_calls", 0) + 1
             decision = self.agent.decide(
@@ -436,6 +438,8 @@ class RunController:
             if len(decision.actions) > 8:
                 raise ActionError("model returned more than 8 tool calls in one turn")
             for index, action in enumerate(decision.actions):
+                current_action = action
+                remaining_actions = decision.actions[index + 1 :]
                 if index and str(action.get("action")) in {
                     "profile_task",
                     "set_plan",
@@ -494,11 +498,23 @@ class RunController:
                 state.counters.get("invalid_actions", 0) + 1
             )
             self.store.append_event("agent_action_rejected", {"error": str(error)})
-            self.store.append_transcript(
-                "user",
-                f"Controller rejected the previous action: {error}",
-                kind="controller_feedback",
-            )
+            if current_action is not None:
+                self._record_rejected_tool_call(state, current_action, str(error))
+                # A native assistant turn must receive one tool result for every
+                # call it issued, including calls skipped after an earlier error.
+                # Otherwise the provider correctly rejects the next request.
+                for pending in remaining_actions:
+                    self._record_rejected_tool_call(
+                        state,
+                        pending,
+                        "not executed because an earlier tool call in this response was rejected",
+                    )
+            else:
+                self.store.append_transcript(
+                    "user",
+                    f"Controller rejected the previous action: {error}",
+                    kind="controller_feedback",
+                )
         return self._commit(state)
 
     def _apply_action(self, state: RunState, action: dict[str, Any]) -> None:
@@ -507,7 +523,9 @@ class RunController:
             "agent_action", {"action": name, "rationale": action.get("rationale", "")}
         )
         if name == "profile_task" and state.phase == "recon":
-            state.profile = TaskProfile.from_dict(self._mapping(action, "profile"))
+            state.profile = TaskProfile.from_dict(
+                self._normalize_profile(self._mapping(action, "profile"))
+            )
             # Optimization runs must preserve and compare the best known artifact.
             # Treat this as a controller invariant instead of trusting a model field:
             # a false value here can let a later losing candidate replace the best
@@ -886,6 +904,26 @@ class RunController:
             kind="tool_result",
             tool_call_id=str(action["_tool_call_id"]),
             name=str(action.get("action", "")),
+        )
+
+    def _record_rejected_tool_call(
+        self, state: RunState, action: dict[str, Any], error: str
+    ) -> None:
+        """Return an error tool result so native tool-call history stays valid."""
+        tool_call_id = str(action.get("_tool_call_id", ""))
+        if not tool_call_id:
+            self.store.append_transcript(
+                "user",
+                f"Controller rejected the previous action: {error}",
+                kind="controller_feedback",
+            )
+            return
+        self.store.append_transcript(
+            "tool",
+            json.dumps({"success": False, "error": error}, ensure_ascii=False),
+            kind="tool_result",
+            tool_call_id=tool_call_id,
+            name=str(action.get("action", "unknown")),
         )
 
     def _tool_evidence(
@@ -1353,6 +1391,54 @@ class RunController:
         if not isinstance(value, dict):
             raise ValueError(f"{key} must be an object")
         return value
+
+    @staticmethod
+    def _normalize_profile(value: dict[str, Any]) -> dict[str, Any]:
+        """Accept concise model profile aliases without silently routing long tasks.
+
+        Tool schemas can be followed loosely by providers.  Treat their common
+        `horizon` / `playbook` aliases as the canonical profile fields rather
+        than defaulting a clearly multi-hour task to the standard work graph.
+        """
+        nested = value.get("profile")
+        source = {**value, **nested} if isinstance(nested, dict) else dict(value)
+        horizon = str(
+            source.get("execution_regime")
+            or source.get("horizon")
+            or source.get("estimated_horizon")
+            or "standard"
+        )
+        regime = "long_horizon" if horizon in {"long_horizon", "multi_hour"} else "standard"
+        playbook = str(
+            source.get("primary_playbook")
+            or source.get("playbook")
+            or source.get("task_type")
+            or source.get("profile")
+            or "generalist"
+        )
+        valid_playbooks = {
+            "repair",
+            "feature",
+            "project",
+            "transformation",
+            "optimization",
+            "generalist",
+        }
+        if playbook not in valid_playbooks:
+            playbook = "generalist"
+        return {
+            "execution_regime": regime,
+            "primary_playbook": playbook,
+            "estimated_horizon": "multi_hour" if regime == "long_horizon" else "short",
+            "validation_cost": "high" if regime == "long_horizon" else "low",
+            "supports_partial_progress": bool(
+                source.get("supports_partial_progress", True)
+            ),
+            "requires_best_artifact": bool(
+                source.get("requires_best_artifact", playbook == "optimization")
+            ),
+            "rationale": str(source.get("rationale", "")),
+        }
 
     @staticmethod
     def _evidence_ids(action: dict[str, Any]) -> list[str]:
