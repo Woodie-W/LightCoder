@@ -141,7 +141,7 @@ class CodingAgent:
         tags = re.findall(r"<action\s+(.*?)/>", content, flags=re.I | re.S)
         children: list[dict[str, Any]] = []
         for attributes in tags:
-            kind_match = re.search(r'\baction="([^"]+)"', attributes)
+            kind_match = re.search(r'\b(?:action|type)="([^"]+)"', attributes)
             if not kind_match or kind_match.group(1) != "bash":
                 return None
             # DeepSeek may leave quotes inside command unescaped. The following
@@ -229,7 +229,7 @@ class CodingAgent:
                 continue
             path_match = re.search(r'"path"\s*:\s*"((?:\\.|[^"\\])*)"', candidate)
             content_match = re.search(
-                r'"content"\s*:\s*"(.*?)"\s*,\s*"rationale"\s*:',
+                r'"content"\s*:\s*"(.*?)"\s*,?\s*"rationale"\s*:',
                 candidate,
                 flags=re.S,
             )

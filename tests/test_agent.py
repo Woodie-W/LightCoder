@@ -56,6 +56,19 @@ def test_parse_action_recovers_deepseek_xml_batch_with_inner_quotes() -> None:
     )
 
 
+def test_parse_action_recovers_deepseek_request_with_type_attribute() -> None:
+    content = '''<request>
+<action type="bash" command="find /reference -type f" cwd="." background="false" rationale="Inspect files"/>
+</request>'''
+    assert CodingAgent.parse_action(content) == {
+        "action": "bash",
+        "command": "find /reference -type f",
+        "cwd": ".",
+        "background": False,
+        "rationale": "Inspect files",
+    }
+
+
 def test_parse_action_recovers_unescaped_multiline_bash_json() -> None:
     content = '''```json
 {
