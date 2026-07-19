@@ -73,3 +73,23 @@ print('ok')
     assert action["action"] == "bash"
     assert action["command"] == 'cd /app && python3 -c "\nprint(\'ok\')\n" 2>&1\n'
     assert action["timeout_seconds"] == 60.0
+
+
+def test_parse_action_recovers_fenced_write_with_literal_source() -> None:
+    content = '''I will create the file.
+```json
+{
+  "action": "write",
+  "path": "src/example.py",
+  "content": "def greeting():
+    return "hello"
+",
+  "rationale": "Add the implementation"
+}
+```'''
+    assert CodingAgent.parse_action(content) == {
+        "action": "write",
+        "path": "src/example.py",
+        "content": 'def greeting():\n    return "hello"\n',
+        "rationale": "Add the implementation",
+    }

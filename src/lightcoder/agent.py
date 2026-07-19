@@ -122,6 +122,9 @@ class CodingAgent:
         relaxed_bash = CodingAgent._parse_relaxed_json_bash(content)
         if relaxed_bash is not None:
             return relaxed_bash
+        relaxed_write = CodingAgent._parse_relaxed_json_write(content)
+        if relaxed_write is not None:
+            return relaxed_write
         if not isinstance(value, dict) or not isinstance(value.get("action"), str):
             if parse_error is not None:
                 raise ActionError(
@@ -210,3 +213,47 @@ class CodingAgent:
         if background_match:
             action["background"] = background_match.group(1) == "true"
         return action
+
+    @staticmethod
+    def _parse_relaxed_json_write(content: str) -> dict[str, Any] | None:
+        """Recover one fenced write action with literal multiline source text.
+
+        Long source files occasionally make the provider emit a JSON-looking
+        write action whose ``content`` field has raw newlines or inner quotes.
+        Treat only a fenced, explicitly labelled write action this way.  The
+        normal JSON parser remains authoritative for every other action.
+        """
+        fenced = re.findall(r"```json\s*\n(.*?)```", content, flags=re.I | re.S)
+        for candidate in fenced:
+            if not re.search(r'"action"\s*:\s*"write"', candidate):
+                continue
+            path_match = re.search(r'"path"\s*:\s*"((?:\\.|[^"\\])*)"', candidate)
+            content_match = re.search(
+                r'"content"\s*:\s*"(.*?)"\s*,\s*"rationale"\s*:',
+                candidate,
+                flags=re.S,
+            )
+            rationale_match = re.search(
+                r'"rationale"\s*:\s*"((?:\\.|[^"\\])*)"\s*}\s*$',
+                candidate,
+                flags=re.S,
+            )
+            if not path_match or not content_match or not rationale_match:
+                continue
+            try:
+                path = json.loads(f'"{path_match.group(1)}"')
+                rationale = json.loads(f'"{rationale_match.group(1)}"')
+            except json.JSONDecodeError:
+                continue
+            raw_content = content_match.group(1)
+            return {
+                "action": "write",
+                "path": path,
+                "content": (
+                    raw_content.replace(r"\n", "\n")
+                    .replace(r'\"', '"')
+                    .replace(r"\\", "\\")
+                ),
+                "rationale": rationale,
+            }
+        return None
