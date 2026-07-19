@@ -117,7 +117,7 @@ def test_long_horizon_bypasses_plan_generation(
                 },
             },
             {
-                "action": "bash",
+                "action": "run",
                 "command": "true",
                 "rationale": "start direct execution",
             },
@@ -139,9 +139,48 @@ def test_long_horizon_bypasses_plan_generation(
     assert len(model.messages) == 2
     flat_prompt = "\n".join(message.content for message in model.messages[1])
     assert '"action":"begin_final_verification"' in flat_prompt
+    assert '"action":"start"' in flat_prompt
     assert "Return set_plan" not in flat_prompt
     events = controller.store.events_path.read_text(encoding="utf-8")
     assert "flat_long_horizon_started" in events
+
+
+def test_run_rejects_legacy_background_flag(tmp_path: Path, skills_root: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "tool protocol",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    with pytest.raises(ValueError, match="use start"):
+        controller._execute_tool(
+            state,
+            {"action": "run", "command": "sleep 1", "background": True},
+        )
+
+
+def test_run_rejects_obvious_persistent_server(tmp_path: Path, skills_root: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "tool protocol",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    with pytest.raises(ValueError, match="use start"):
+        controller._execute_tool(
+            state,
+            {"action": "run", "command": "python -m uvicorn app:app"},
+        )
 
 
 def test_optimization_deadline_restores_last_accepted_checkpoint(

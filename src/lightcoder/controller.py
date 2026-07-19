@@ -39,14 +39,15 @@ Mandatory work items must describe a path to satisfying the objective, including
 Verification commands must be executable in the observed environment. Use python3 rather than python unless a python executable has already been observed. Prefer Python standard-library checks for numeric thresholds instead of assuming utilities such as bc are installed."""
 
 WORK_ACTIONS = """Return exactly one action:
-{"action":"bash","command":"...","cwd":".","background":false,"rationale":"..."}
+{"action":"run","command":"...","cwd":".","timeout_seconds":300,"rationale":"bounded command"}
+{"action":"start","command":"...","cwd":".","rationale":"managed service or long job"}
 {"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
-{"action":"read_command_output","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a truncated command log"}
+{"action":"logs","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a managed-job log"}
 {"action":"write","path":"...","content":"...","rationale":"..."}
 {"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
-{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"bash","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
+{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"run","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
 {"action":"poll","command_id":"cmd-..."}
-{"action":"terminate","command_id":"cmd-..."}
+{"action":"stop","command_id":"cmd-..."}
 {"action":"begin_verification","rationale":"implementation is ready for its acceptance oracle"}
 {"action":"accept_work_item","evidence_ids":["ev-..."],"summary":"why the acceptance criteria pass"}
 {"action":"reject_work_item","evidence_ids":["ev-..."],"failure_signature":"specific observed failure","next_strategy":"materially different next approach"}
@@ -55,7 +56,8 @@ WORK_ACTIONS = """Return exactly one action:
 {"action":"rotate_context","reason":"...","next_action":"..."}
 {"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
 Prefer edit over rewriting an existing file. Prefer batch for independent reads, inspections, and small edits. Prefer one focused bash script over many tiny shell turns.
-Batch children execute sequentially. Never use batch to launch multiple long jobs under the assumption that they run in parallel; start each long job as a separate background bash action and poll it.
+run is for bounded commands only: default 300 seconds, maximum 1200 seconds. Never put `&` in a run command. Use start for every server, --stdio process, watch mode, or job expected to run longer than a few minutes; it returns a job id for poll/logs/stop.
+Batch children execute sequentially and may not use start. Never use batch to launch multiple long jobs under the assumption that they run in parallel; start each long job separately and poll it.
 When a known check is needed after a mutation, default to one batch containing the edit/write followed by the focused bash check so both happen in one model turn.
 Keep bash actions short and auditable. For Python logic longer than a few lines, write a named helper script and execute it instead of embedding a large python heredoc or python -c program; this gives syntax-check evidence, preserves reusable instrumentation, and avoids shell/JSON quoting failures.
 Do not reread the same file or repeat the same inspection at an unchanged workspace revision unless the previous observation was truncated and you request a specific unseen range.
@@ -66,14 +68,15 @@ After begin_verification, the controller runs the exact verification commands au
 Do not accept an item without current-revision observational evidence. Use begin_verification before acceptance."""
 
 LONG_HORIZON_ACTIONS = """Return exactly one action:
-{"action":"bash","command":"...","cwd":".","background":false,"rationale":"..."}
+{"action":"run","command":"...","cwd":".","timeout_seconds":300,"rationale":"bounded command"}
+{"action":"start","command":"...","cwd":".","rationale":"managed service or long experiment"}
 {"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
-{"action":"read_command_output","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a truncated command log"}
+{"action":"logs","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a managed-job log"}
 {"action":"write","path":"...","content":"...","rationale":"..."}
 {"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
-{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"bash","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
+{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"run","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
 {"action":"poll","command_id":"cmd-..."}
-{"action":"terminate","command_id":"cmd-..."}
+{"action":"stop","command_id":"cmd-..."}
 {"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"score","metric_value":0.0,"metric_direction":"maximize|minimize","evidence_ids":["ev-..."],"artifact_paths":[]}
 {"action":"rotate_context","reason":"...","next_action":"..."}
 {"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
@@ -82,12 +85,12 @@ There is no controller-managed work-item plan in long-horizon mode. Keep decompo
 Create a valid scoreable baseline for every required deliverable early. Then allocate effort by measured correctness or metric gain per wall-clock time.
 Treat required deliverable paths as promoted best-so-far artifacts. Run experiments on candidate paths, independently score them, and atomically promote only verified improvements. Checkpoint all currently valid required deliverables together after a material improvement.
 Every checkpoint requires successful current-revision command evidence. For optimization checkpoints, provide a numeric metric and its minimize/maximize direction; the controller retains a non-improving snapshot as history but does not replace the best checkpoint.
-Batch children execute sequentially. Start independent long jobs as separate background bash actions and poll them. Microbenchmark before a long search and leave time for final verification.
+run is for bounded commands only: default 300 seconds, maximum 1200 seconds. Never put `&` in a run command. Start independent long jobs as separate start actions, then poll/logs/stop them. Microbenchmark before a long search and leave time for final verification.
 Prefer edit over rewriting an existing file. Keep bash actions short and auditable. Put nontrivial Python logic in a named helper file rather than a heredoc or large python -c command.
 Do not reread unchanged files or repeat failed experiments without a materially different hypothesis. Use rotate_context for a compact handoff when history grows.
 Use begin_final_verification only after running relevant checks and confirming required artifacts exist. Continue useful implementation and testing until then; the controller does not reserve a fixed hardening fraction."""
 
-FINAL_VERIFY_ACTIONS = """Run final integration checks with bash/read, or return:
+FINAL_VERIFY_ACTIONS = """Run final integration checks with run/read, or return:
 {"action":"final_verified","evidence_ids":["ev-..."],"summary":"why all mandatory outcomes and regressions pass","risks":["..."]}
 You may also use rotate_context. final_verified requires successful current-revision command evidence."""
 
@@ -405,12 +408,16 @@ class RunController:
             return
         if name in {
             "bash",
+            "run",
+            "start",
             "read",
             "read_command_output",
+            "logs",
             "write",
             "edit",
             "poll",
             "terminate",
+            "stop",
         }:
             if state.phase not in {
                 "standard_work",
@@ -428,14 +435,14 @@ class RunController:
             actions = action.get("actions", action.get("batched_actions"))
             if not isinstance(actions, list) or not actions or len(actions) > 8:
                 raise ValueError("batch requires between 1 and 8 actions")
-            allowed = {"bash", "read", "write", "edit"}
+            allowed = {"bash", "run", "read", "write", "edit"}
             for child in actions:
                 if not isinstance(child, dict) or child.get("action") not in allowed:
                     raise ValueError(
-                        "batch only supports bash, read, write, and edit actions"
+                        "batch only supports run, read, write, and edit actions"
                     )
                 if child.get("action") == "bash" and child.get("background"):
-                    raise ValueError("background bash is not allowed inside batch")
+                    raise ValueError("start is not allowed inside batch")
             rejected_children: list[str] = []
             executed_children = 0
             for child in actions:
@@ -537,7 +544,7 @@ class RunController:
                 for command in self.commands.recover()
             ):
                 raise ValueError(
-                    "wait requires a running background command; tool results are already synchronous"
+                    "wait requires a running managed job; run tool results are synchronous"
                 )
             state.status = "waiting"
             self.store.append_event(
@@ -590,20 +597,40 @@ class RunController:
             raise ValueError("deadline reached before tool execution")
         if name in {"write", "edit"}:
             self._require_mutation_feedback(state, str(action.get("path", "")))
-        if name == "bash":
+        if name in {"bash", "run"}:
+            # `bash` plus background is accepted only for old trajectories.
+            # New prompts expose the unambiguous `start` action instead.
+            if name == "bash" and bool(action.get("background", False)):
+                result = self.commands.start(
+                    str(action.get("command", "")),
+                    cwd=str(action.get("cwd", ".")),
+                )
+                self._record_tool_result(state, action, result)
+                return
+            if name == "run" and "background" in action:
+                raise ValueError("run has no background mode; use start for managed jobs")
+            command = str(action.get("command", ""))
+            if self._requires_managed_start(command):
+                raise ValueError(
+                    "run appears to start a persistent process; use start, then poll/logs/stop"
+                )
             requested_timeout = action.get("timeout_seconds")
-            timeout_seconds = (
-                float(requested_timeout)
-                if requested_timeout is not None
-                else (max(1.0, remaining) if remaining is not None else None)
+            timeout_seconds = float(requested_timeout) if requested_timeout is not None else 300.0
+            timeout_seconds = min(
+                CommandSupervisor.MAX_RUN_TIMEOUT_SECONDS,
+                max(1.0, timeout_seconds),
             )
             if remaining is not None:
                 timeout_seconds = min(timeout_seconds, max(1.0, remaining))
             result = self.commands.run(
-                str(action.get("command", "")),
+                command,
                 cwd=str(action.get("cwd", ".")),
                 timeout_seconds=timeout_seconds,
-                background=bool(action.get("background", False)),
+            )
+        elif name == "start":
+            result = self.commands.start(
+                str(action.get("command", "")),
+                cwd=str(action.get("cwd", ".")),
             )
         elif name == "read":
             self._require_new_read_range(state, action)
@@ -612,7 +639,7 @@ class RunController:
                 start_line=int(action.get("start_line", 1)),
                 max_lines=int(action.get("max_lines", 400)),
             )
-        elif name == "read_command_output":
+        elif name in {"read_command_output", "logs"}:
             result = self.commands.read_output(
                 str(action.get("command_id", "")),
                 start_line=int(action.get("start_line", 1)),
@@ -633,6 +660,11 @@ class RunController:
             result = self.commands.poll(str(action.get("command_id", "")))
         else:
             result = self.commands.terminate(str(action.get("command_id", "")))
+        self._record_tool_result(state, action, result)
+
+    def _record_tool_result(
+        self, state: RunState, action: dict[str, Any], result: ToolResult
+    ) -> None:
         evidence = self._tool_evidence(state, result, action)
         self.store.record_evidence(evidence)
         state.evidence_ids.append(evidence.id)
@@ -642,7 +674,7 @@ class RunController:
         self.store.append_event(
             "tool_result", {"evidence_id": evidence.id, **result.to_dict()}
         )
-        if name in {"write", "edit"} and result.success:
+        if str(action["action"]) in {"write", "edit"} and result.success:
             automatic_command = self._automatic_mutation_check(
                 str(action.get("path", ""))
             )
@@ -674,15 +706,15 @@ class RunController:
     def _tool_evidence(
         self, state: RunState, result: ToolResult, action: dict[str, Any]
     ) -> Evidence:
-        if result.tool in {"bash", "poll", "terminate"}:
+        if result.tool in {"bash", "run", "start", "poll", "stop", "terminate"}:
             kind = "command"
-        elif result.tool in {"read", "read_command_output"}:
+        elif result.tool in {"read", "read_command_output", "logs"}:
             kind = "observation"
         else:
             kind = "mutation"
         summary_limit = (
             16_000
-            if result.tool in {"read", "read_command_output"}
+            if result.tool in {"read", "read_command_output", "logs"}
             else 20_000
         )
         action_path = str(action.get("path", ""))
@@ -784,16 +816,35 @@ class RunController:
         return ""
 
     @staticmethod
+    def _requires_managed_start(command: str) -> bool:
+        """Catch only unambiguous service/watch modes before they can block run."""
+        normalized = f" {command.lower()} "
+        markers = (
+            " --stdio",
+            " uvicorn ",
+            " gunicorn ",
+            " runserver",
+            " start.sh",
+            " npm run dev",
+            " --watch",
+            " tail -f",
+            " sleep infinity",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
     def _validate_tool_action(action: dict[str, Any]) -> None:
         name = str(action.get("action", ""))
-        if name == "bash" and not isinstance(action.get("command"), str):
-            raise ValueError("bash requires a string command")
+        if name in {"bash", "run", "start"} and not isinstance(
+            action.get("command"), str
+        ):
+            raise ValueError(f"{name} requires a string command")
         if name == "read" and not isinstance(action.get("path"), str):
             raise ValueError("read requires a string path")
-        if name == "read_command_output" and not isinstance(
+        if name in {"read_command_output", "logs", "poll", "terminate", "stop"} and not isinstance(
             action.get("command_id"), str
         ):
-            raise ValueError("read_command_output requires a string command_id")
+            raise ValueError(f"{name} requires a string command_id")
         if name == "write" and not isinstance(action.get("content"), str):
             raise ValueError("write requires an explicit string content field")
         if name == "write" and not isinstance(action.get("path"), str):

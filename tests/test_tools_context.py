@@ -62,7 +62,7 @@ def test_background_command_preserves_identity_log_and_exit_code(
 ) -> None:
     _, _, tools, _ = make_runtime(tmp_path, skills_root)
     supervisor = CommandSupervisor(tools)
-    started = supervisor.run("sleep 0.05; printf finished", background=True)
+    started = supervisor.start("sleep 0.05; printf finished")
     assert started.success
     assert started.data["pid"] > 0
     deadline = time.monotonic() + 2
@@ -74,6 +74,15 @@ def test_background_command_preserves_identity_log_and_exit_code(
         time.sleep(0.02)
     assert result.exit_code == 0
     assert "finished" in result.output
+
+
+def test_run_does_not_hang_on_accidental_background_descendant(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    result = CommandSupervisor(tools).run("sleep 10 &", timeout_seconds=1)
+    assert result.exit_code == 125
+    assert "Use the start action" in result.output
 
 
 def test_command_output_can_be_read_by_line_after_context_truncation(

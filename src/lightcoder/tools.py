@@ -435,6 +435,11 @@ class WorkspaceTools:
 
 
 class CommandSupervisor:
+    """Small job broker used by the LLM-facing run/start/poll/logs/stop tools."""
+
+    DEFAULT_RUN_TIMEOUT_SECONDS = 300.0
+    MAX_RUN_TIMEOUT_SECONDS = 1_200.0
+
     def __init__(self, tools: WorkspaceTools) -> None:
         self.tools = tools
 
@@ -458,53 +463,105 @@ class CommandSupervisor:
                 raise ToolPolicyError(f"cwd is not a directory: {cwd}")
             process_env = os.environ.copy()
             process_env.update(env or {})
+            # Kept only for backwards-compatible callers.  The LLM contract
+            # exposes this explicitly as `start`, rather than a boolean on a
+            # general shell tool.
             if background:
-                return self._start_background(
-                    command_id, command, workdir, log_path, process_env, started
+                return self.start(
+                    command, cwd=cwd, env=env
                 )
-            process = subprocess.Popen(
-                command,
-                cwd=workdir,
-                env=process_env,
-                shell=True,
-                executable="/bin/bash",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
-            try:
-                output, _ = process.communicate(
-                    timeout=(
-                        max(0.1, timeout_seconds)
+            bounded_timeout = min(
+                self.MAX_RUN_TIMEOUT_SECONDS,
+                max(
+                    0.1,
+                    (
+                        timeout_seconds
                         if timeout_seconds is not None
-                        else None
-                    )
+                        else self.DEFAULT_RUN_TIMEOUT_SECONDS
+                    ),
+                ),
+            )
+            with log_path.open("w", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=workdir,
+                    env=process_env,
+                    shell=True,
+                    executable="/bin/bash",
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
                 )
-                exit_code = process.returncode
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGTERM)
                 try:
-                    output, _ = process.communicate(timeout=2.0)
+                    # Wait for the shell process only.  Its output is written
+                    # directly to a durable file, so an accidental `cmd &`
+                    # child cannot retain a pipe and block the controller.
+                    process.wait(timeout=bounded_timeout)
+                    exit_code = process.returncode
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    output, _ = process.communicate()
-                output += f"\ncommand timed out after {timeout_seconds:.1f}s"
-                exit_code = 124
-            log_path.write_text(output, encoding="utf-8")
+                    self._terminate_process_group(process.pid)
+                    process.wait(timeout=2.0)
+                    exit_code = 124
+        except subprocess.TimeoutExpired:
+            # A stubborn process group is already signalled above; still
+            # produce a recoverable tool result instead of trapping the agent.
+            exit_code = 124
+            bounded_timeout = timeout_seconds or self.DEFAULT_RUN_TIMEOUT_SECONDS
+        except (OSError, ToolPolicyError) as error:
             return ToolResult(
-                "bash",
-                command_id,
-                exit_code == 0,
-                time.monotonic() - started,
-                output=self.tools.compact(output),
-                raw_log=str(log_path.relative_to(self.tools.store.run_dir)),
-                exit_code=exit_code,
+                "run", command_id, False, time.monotonic() - started, output=str(error)
+            )
+
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        if exit_code == 124:
+            output += f"\ncommand timed out after {bounded_timeout:.1f}s"
+        elif self._process_group_running(process.pid):
+            # A foreground action that spawns `server &` is neither observable
+            # nor controllable by later poll/stop actions.  Kill it and make
+            # the recovery path explicit to the model.
+            self._terminate_process_group(process.pid)
+            exit_code = 125
+            output += (
+                "\nforeground command left background descendants; they were "
+                "terminated. Use the start action for services or long jobs."
+            )
+        log_path.write_text(output, encoding="utf-8")
+        return ToolResult(
+            "run",
+            command_id,
+            exit_code == 0,
+            time.monotonic() - started,
+            output=self.tools.compact(output),
+            raw_log=str(log_path.relative_to(self.tools.store.run_dir)),
+            exit_code=exit_code,
+        )
+
+    def start(
+        self,
+        command: str,
+        *,
+        cwd: str = ".",
+        env: dict[str, str] | None = None,
+    ) -> ToolResult:
+        """Start a managed long-running job and immediately return its id."""
+        started = time.monotonic()
+        command_id = new_id("cmd")
+        log_path = self.tools.store.command_log_path(command_id)
+        try:
+            if not command.strip():
+                raise ToolPolicyError("command must not be empty")
+            workdir = self.tools.resolve_path(cwd)
+            if not workdir.is_dir():
+                raise ToolPolicyError(f"cwd is not a directory: {cwd}")
+            process_env = os.environ.copy()
+            process_env.update(env or {})
+            return self._start_background(
+                command_id, command, workdir, log_path, process_env, started
             )
         except (OSError, ToolPolicyError) as error:
             return ToolResult(
-                "bash", command_id, False, time.monotonic() - started, output=str(error)
+                "start", command_id, False, time.monotonic() - started, output=str(error)
             )
 
     def _start_background(
@@ -543,11 +600,11 @@ class CommandSupervisor:
         }
         self._write_metadata(command_id, metadata)
         return ToolResult(
-            "bash",
+            "start",
             command_id,
             True,
             time.monotonic() - started,
-            output=f"background command started with pid {process.pid}",
+            output=f"managed job started with pid {process.pid}",
             raw_log=metadata["log"],
             background_id=command_id,
             data={"pid": process.pid, "status": "running"},
@@ -655,7 +712,7 @@ class CommandSupervisor:
             metadata["terminated_at"] = utc_now()
             self._write_metadata(command_id, metadata)
             return ToolResult(
-                "terminate",
+                "stop",
                 new_id("term"),
                 True,
                 time.monotonic() - started,
@@ -664,12 +721,40 @@ class CommandSupervisor:
             )
         except (OSError, ValueError, KeyError) as error:
             return ToolResult(
-                "terminate",
+                "stop",
                 new_id("term"),
                 False,
                 time.monotonic() - started,
                 output=str(error),
             )
+
+    @staticmethod
+    def _process_group_running(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def _terminate_process_group(process_group_id: int) -> None:
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 0.2
+        while (
+            CommandSupervisor._process_group_running(process_group_id)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        if CommandSupervisor._process_group_running(process_group_id):
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def recover(self) -> list[dict[str, Any]]:
         recovered: list[dict[str, Any]] = []
