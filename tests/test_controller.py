@@ -134,6 +134,32 @@ def test_rejected_native_tool_call_gets_a_tool_response(
     assert json.loads(message["content"])["success"] is False
 
 
+def test_final_delivery_stops_managed_jobs(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "final cleanup", workspace, ScriptedModel([]), state_root=tmp_path / "state", skills_root=skills_root
+    )
+    state = controller.store.load()
+    started = controller.commands.start("sleep 30")
+    assert started.success
+    state.phase = "deliver"
+    state.final["verification"] = {"evidence_ids": ["ev-placeholder"]}
+    controller._apply_action(
+        state,
+        {
+            "action": "final_delivery",
+            "summary": "done",
+            "tests": [],
+            "changed_files": [],
+            "risks": [],
+        },
+    )
+    assert controller.commands.poll(started.background_id).data["status"] == "exited"
+
+
 def test_long_horizon_bypasses_plan_generation(
     tmp_path: Path, skills_root: Path
 ) -> None:

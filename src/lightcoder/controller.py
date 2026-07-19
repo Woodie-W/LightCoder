@@ -435,8 +435,6 @@ class RunController:
             # messages will be replayed on the next model call.  Restrict control
             # actions to one per turn so a stale parallel plan cannot skip a
             # controller phase transition.
-            if len(decision.actions) > 8:
-                raise ActionError("model returned more than 8 tool calls in one turn")
             for index, action in enumerate(decision.actions):
                 current_action = action
                 remaining_actions = decision.actions[index + 1 :]
@@ -722,6 +720,7 @@ class RunController:
         if name == "final_delivery" and state.phase == "deliver":
             if "verification" not in state.final:
                 raise ValueError("final verification is missing")
+            self._terminate_managed_jobs(state, reason="final_delivery")
             state.final["delivery"] = {
                 "summary": str(action.get("summary", "")),
                 "tests": list(action.get("tests", [])),
@@ -1296,19 +1295,9 @@ class RunController:
         elapsed = self._deadline_elapsed()
         state.counters["elapsed_seconds"] = int(elapsed)
         if elapsed >= limit:
-            terminated: list[str] = []
-            for command in self.commands.recover():
-                if command.get("status") != "running":
-                    continue
-                command_id = str(command.get("id", ""))
-                result = self.commands.terminate(command_id)
-                if result.success:
-                    terminated.append(command_id)
-            if terminated:
-                self.store.append_event(
-                    "deadline_background_commands_terminated",
-                    {"command_ids": terminated},
-                )
+            terminated = self._terminate_managed_jobs(
+                state, reason="deadline"
+            )
             self._restore_best_checkpoint_at_deadline(state)
             state.status = "paused_limit"
             state.final["limit"] = {
@@ -1320,6 +1309,23 @@ class RunController:
             self.store.append_event("hard_deadline_reached", state.final["limit"])
             return True
         return False
+
+    def _terminate_managed_jobs(self, state: RunState, *, reason: str) -> list[str]:
+        """End every managed process before a deadline or final verifier handoff."""
+        terminated: list[str] = []
+        for command in self.commands.recover():
+            if command.get("status") != "running":
+                continue
+            command_id = str(command.get("id", ""))
+            result = self.commands.terminate(command_id)
+            if result.success:
+                terminated.append(command_id)
+        if terminated:
+            self.store.append_event(
+                f"{reason}_background_commands_terminated",
+                {"command_ids": terminated},
+            )
+        return terminated
 
     def _deadline_elapsed(self) -> float:
         return self._deadline_elapsed_base + (
