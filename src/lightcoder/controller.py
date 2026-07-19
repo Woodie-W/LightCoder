@@ -39,8 +39,9 @@ Mandatory work items must describe a path to satisfying the objective, including
 Verification commands must be executable in the observed environment. Use python3 rather than python unless a python executable has already been observed. Prefer Python standard-library checks for numeric thresholds instead of assuming utilities such as bc are installed."""
 
 WORK_ACTIONS = """Return exactly one action:
-{"action":"bash","command":"...","cwd":".","timeout_seconds":1800,"background":false,"rationale":"..."}
+{"action":"bash","command":"...","cwd":".","background":false,"rationale":"..."}
 {"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
+{"action":"read_command_output","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a truncated command log"}
 {"action":"write","path":"...","content":"...","rationale":"..."}
 {"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
 {"action":"batch","actions":[{"action":"read","path":"..."},{"action":"bash","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
@@ -50,7 +51,7 @@ WORK_ACTIONS = """Return exactly one action:
 {"action":"accept_work_item","evidence_ids":["ev-..."],"summary":"why the acceptance criteria pass"}
 {"action":"reject_work_item","evidence_ids":["ev-..."],"failure_signature":"specific observed failure","next_strategy":"materially different next approach"}
 {"action":"revise_plan","work_items":[...],"rationale":"new evidence requiring decomposition change"}
-{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"","metric_value":null,"artifact_paths":[]}
+{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"score","metric_value":0.0,"metric_direction":"maximize|minimize","evidence_ids":["ev-..."],"artifact_paths":[]}
 {"action":"rotate_context","reason":"...","next_action":"..."}
 {"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
 Prefer edit over rewriting an existing file. Prefer batch for independent reads, inspections, and small edits. Prefer one focused bash script over many tiny shell turns.
@@ -65,24 +66,26 @@ After begin_verification, the controller runs the exact verification commands au
 Do not accept an item without current-revision observational evidence. Use begin_verification before acceptance."""
 
 LONG_HORIZON_ACTIONS = """Return exactly one action:
-{"action":"bash","command":"...","cwd":".","timeout_seconds":1800,"background":false,"rationale":"..."}
+{"action":"bash","command":"...","cwd":".","background":false,"rationale":"..."}
 {"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
+{"action":"read_command_output","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a truncated command log"}
 {"action":"write","path":"...","content":"...","rationale":"..."}
 {"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
 {"action":"batch","actions":[{"action":"read","path":"..."},{"action":"bash","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
 {"action":"poll","command_id":"cmd-..."}
 {"action":"terminate","command_id":"cmd-..."}
-{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"","metric_value":null,"artifact_paths":[]}
+{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"score","metric_value":0.0,"metric_direction":"maximize|minimize","evidence_ids":["ev-..."],"artifact_paths":[]}
 {"action":"rotate_context","reason":"...","next_action":"..."}
 {"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
 {"action":"begin_final_verification","rationale":"all required deliverables are ready for a clean final check"}
 There is no controller-managed work-item plan in long-horizon mode. Keep decomposition advisory and freely change strategy from observations; never wait for an artificial milestone before working on another part of the objective.
 Create a valid scoreable baseline for every required deliverable early. Then allocate effort by measured correctness or metric gain per wall-clock time.
 Treat required deliverable paths as promoted best-so-far artifacts. Run experiments on candidate paths, independently score them, and atomically promote only verified improvements. Checkpoint all currently valid required deliverables together after a material improvement.
+Every checkpoint requires successful current-revision command evidence. For optimization checkpoints, provide a numeric metric and its minimize/maximize direction; the controller retains a non-improving snapshot as history but does not replace the best checkpoint.
 Batch children execute sequentially. Start independent long jobs as separate background bash actions and poll them. Microbenchmark before a long search and leave time for final verification.
 Prefer edit over rewriting an existing file. Keep bash actions short and auditable. Put nontrivial Python logic in a named helper file rather than a heredoc or large python -c command.
 Do not reread unchanged files or repeat failed experiments without a materially different hypothesis. Use rotate_context for a compact handoff when history grows.
-Use begin_final_verification only after running relevant checks and confirming required artifacts exist. The controller also enters final verification automatically near the deadline."""
+Use begin_final_verification only after running relevant checks and confirming required artifacts exist. Continue useful implementation and testing until then; the controller does not reserve a fixed hardening fraction."""
 
 FINAL_VERIFY_ACTIONS = """Run final integration checks with bash/read, or return:
 {"action":"final_verified","evidence_ids":["ev-..."],"summary":"why all mandatory outcomes and regressions pass","risks":["..."]}
@@ -126,6 +129,21 @@ class RunController:
             not in state.runtime_config.get("ablations", []),
         )
         self.agent = CodingAgent(model, self.context, store)
+        persisted_elapsed = float(state.counters.get("elapsed_seconds", 0))
+        try:
+            # Monotonic clocks do not survive a process restart. Count only a
+            # non-negative wall-clock gap since the last persisted update, then
+            # use monotonic time for the lifetime of this controller process.
+            # A backward WSL clock correction therefore cannot erase elapsed
+            # runtime or delay the internal deadline.
+            persisted_elapsed += max(
+                0.0,
+                time.time() - datetime.fromisoformat(state.updated_at).timestamp(),
+            )
+        except ValueError:
+            pass
+        self._deadline_elapsed_base = persisted_elapsed
+        self._deadline_monotonic_started = time.monotonic()
 
     @classmethod
     def create(
@@ -276,7 +294,6 @@ class RunController:
                             "action": "bash",
                             "command": command,
                             "cwd": ".",
-                            "timeout_seconds": 1_800,
                             "background": False,
                             "rationale": "controller-managed acceptance verification",
                         },
@@ -300,8 +317,10 @@ class RunController:
         core_skill: str,
         playbook: str | None = None,
     ) -> RunState:
-        if state.episodes and state.episodes[-1].token_estimate >= int(
-            self.context.context_window_tokens * self.context.rotate_fraction
+        if (
+            state.episodes
+            and state.episodes[-1].token_estimate
+            >= self.context.rotation_threshold_tokens
         ):
             self.context.rotate(
                 state, reason="context_threshold", next_action="continue current phase"
@@ -310,7 +329,11 @@ class RunController:
         try:
             state.counters["model_calls"] = state.counters.get("model_calls", 0) + 1
             decision = self.agent.decide(
-                state, contract, core_skill=core_skill, playbook=playbook
+                state,
+                contract,
+                core_skill=core_skill,
+                playbook=playbook,
+                timeout_seconds=self._model_request_timeout(state),
             )
             state.counters["consecutive_model_errors"] = 0
             state.retry_at = ""
@@ -380,7 +403,15 @@ class RunController:
             state.work_items = items
             state.phase = "standard_work"
             return
-        if name in {"bash", "read", "write", "edit", "poll", "terminate"}:
+        if name in {
+            "bash",
+            "read",
+            "read_command_output",
+            "write",
+            "edit",
+            "poll",
+            "terminate",
+        }:
             if state.phase not in {
                 "standard_work",
                 "long_horizon_work",
@@ -515,12 +546,11 @@ class RunController:
             )
             return
         if name == "final_verified" and state.phase == "final_verify":
-            hardening = bool(state.final.get("deadline_hardening"))
             flat_long_horizon = bool(
                 state.profile
                 and state.profile.execution_regime == "long_horizon"
             )
-            if not state.mandatory_complete() and not hardening and not flat_long_horizon:
+            if not state.mandatory_complete() and not flat_long_horizon:
                 raise ValueError("mandatory work is incomplete")
             ids = self._evidence_ids(action)
             self._validate_evidence(
@@ -533,8 +563,7 @@ class RunController:
                 "summary": str(action.get("summary", "")),
                 "risks": list(action.get("risks", [])),
                 "workspace_revision": self.tools.workspace_revision(),
-                "partial": hardening
-                or (not flat_long_horizon and not state.mandatory_complete()),
+                "partial": not flat_long_horizon and not state.mandatory_complete(),
             }
             state.phase = "deliver"
             return
@@ -549,28 +578,43 @@ class RunController:
                 "delivered_at": utc_now(),
             }
             state.phase = "done"
-            state.status = (
-                "paused_limit" if state.final.get("deadline_hardening") else "completed"
-            )
+            state.status = "completed"
             return
         raise ValueError(f"action {name!r} is not allowed in phase {state.phase}")
 
     def _execute_tool(self, state: RunState, action: dict[str, Any]) -> None:
         name = str(action["action"])
         self._validate_tool_action(action)
+        remaining = self._deadline_remaining(state)
+        if remaining is not None and remaining <= 0:
+            raise ValueError("deadline reached before tool execution")
         if name in {"write", "edit"}:
             self._require_mutation_feedback(state, str(action.get("path", "")))
         if name == "bash":
+            requested_timeout = action.get("timeout_seconds")
+            timeout_seconds = (
+                float(requested_timeout)
+                if requested_timeout is not None
+                else (max(1.0, remaining) if remaining is not None else None)
+            )
+            if remaining is not None:
+                timeout_seconds = min(timeout_seconds, max(1.0, remaining))
             result = self.commands.run(
                 str(action.get("command", "")),
                 cwd=str(action.get("cwd", ".")),
-                timeout_seconds=float(action.get("timeout_seconds", 1_800)),
+                timeout_seconds=timeout_seconds,
                 background=bool(action.get("background", False)),
             )
         elif name == "read":
             self._require_new_read_range(state, action)
             result = self.tools.read(
                 str(action.get("path", "")),
+                start_line=int(action.get("start_line", 1)),
+                max_lines=int(action.get("max_lines", 400)),
+            )
+        elif name == "read_command_output":
+            result = self.commands.read_output(
+                str(action.get("command_id", "")),
                 start_line=int(action.get("start_line", 1)),
                 max_lines=int(action.get("max_lines", 400)),
             )
@@ -632,11 +676,15 @@ class RunController:
     ) -> Evidence:
         if result.tool in {"bash", "poll", "terminate"}:
             kind = "command"
-        elif result.tool == "read":
+        elif result.tool in {"read", "read_command_output"}:
             kind = "observation"
         else:
             kind = "mutation"
-        summary_limit = 16_000 if result.tool == "read" else 4_000
+        summary_limit = (
+            16_000
+            if result.tool in {"read", "read_command_output"}
+            else 20_000
+        )
         action_path = str(action.get("path", ""))
         return Evidence(
             id=new_id("ev"),
@@ -656,6 +704,7 @@ class RunController:
                 "path": self._relative_action_path(action_path) if action_path else "",
                 "start_line": int(action.get("start_line", 1)),
                 "max_lines": int(action.get("max_lines", 400)),
+                "tool_call_id": result.call_id,
                 "model_call": state.counters.get("model_calls", 0),
                 **result.data,
             },
@@ -741,6 +790,10 @@ class RunController:
             raise ValueError("bash requires a string command")
         if name == "read" and not isinstance(action.get("path"), str):
             raise ValueError("read requires a string path")
+        if name == "read_command_output" and not isinstance(
+            action.get("command_id"), str
+        ):
+            raise ValueError("read_command_output requires a string command_id")
         if name == "write" and not isinstance(action.get("content"), str):
             raise ValueError("write requires an explicit string content field")
         if name == "write" and not isinstance(action.get("path"), str):
@@ -826,6 +879,31 @@ class RunController:
         ]
 
     def _checkpoint(self, state: RunState, action: dict[str, Any]) -> None:
+        evidence_ids = self._evidence_ids(action)
+        self._validate_evidence(evidence_ids, require_successful_command=True)
+        metric_name = str(action.get("metric_name", "")).strip()
+        metric_value = (
+            float(action["metric_value"])
+            if action.get("metric_value") is not None
+            else None
+        )
+        metric_direction = str(action.get("metric_direction", "")).strip()
+        requires_metric = bool(
+            state.profile
+            and state.profile.requires_best_artifact
+        )
+        if metric_value is not None and (
+            not metric_name or metric_direction not in {"maximize", "minimize"}
+        ):
+            raise ValueError(
+                "numeric checkpoint metrics require metric_name and "
+                "metric_direction=maximize|minimize"
+            )
+        if requires_metric and metric_value is None:
+            raise ValueError(
+                "best-artifact checkpoints require a numeric metric_value"
+            )
+
         checkpoint_id = new_id("checkpoint")
         changed_files = self.tools.changed_files()
         artifact_paths = [str(path) for path in action.get("artifact_paths", [])]
@@ -844,15 +922,64 @@ class RunController:
             restore_notes=str(action.get("restore_notes", "")),
             base_revision=self.tools.git_head(),
             snapshot_path=snapshot_path,
-            metric_name=str(action.get("metric_name", "")),
-            metric_value=float(action["metric_value"])
-            if action.get("metric_value") is not None
-            else None,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            metric_direction=metric_direction,
+            validation_evidence_ids=evidence_ids,
             artifact_paths=artifact_paths,
         )
         self.store.write_checkpoint(checkpoint)
-        state.best_checkpoint_id = checkpoint.id
-        self.store.append_event("checkpoint_promoted", asdict(checkpoint))
+        promoted, reason = self._checkpoint_improves_best(state, checkpoint)
+        if promoted:
+            state.best_checkpoint_id = checkpoint.id
+            self.store.append_event("checkpoint_promoted", asdict(checkpoint))
+        else:
+            self.store.append_event(
+                "checkpoint_retained_not_promoted",
+                {**asdict(checkpoint), "reason": reason},
+            )
+            self.store.append_transcript(
+                "user",
+                f"Checkpoint retained as history but did not replace the best: {reason}",
+                kind="controller_feedback",
+            )
+
+    def _checkpoint_improves_best(
+        self, state: RunState, checkpoint: Checkpoint
+    ) -> tuple[bool, str]:
+        if not state.best_checkpoint_id:
+            return True, "first validated checkpoint"
+        path = self.store.checkpoints_dir / f"{state.best_checkpoint_id}.json"
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return True, "previous best metadata is unavailable"
+        previous_value = previous.get("metric_value")
+        previous_name = str(previous.get("metric_name", ""))
+        previous_direction = str(previous.get("metric_direction", ""))
+        if checkpoint.metric_value is None:
+            if previous_value is not None:
+                return False, "new checkpoint omitted the existing scalar metric"
+            return True, "newer validated checkpoint without a scalar metric"
+        if previous_value is None:
+            return True, "previous checkpoint has no comparable metric"
+        if previous_name != checkpoint.metric_name:
+            return False, (
+                f"metric changed from {previous_name!r} to "
+                f"{checkpoint.metric_name!r}"
+            )
+        if previous_direction and previous_direction != checkpoint.metric_direction:
+            return False, "metric direction changed"
+        old = float(previous_value)
+        new = float(checkpoint.metric_value)
+        improved = (
+            new > old
+            if checkpoint.metric_direction == "maximize"
+            else new < old
+        )
+        if improved:
+            return True, f"metric improved from {old} to {new}"
+        return False, f"metric did not improve beyond {old}"
 
     def _parse_plan(self, value: Any) -> list[WorkItem]:
         if not isinstance(value, list) or not value:
@@ -892,46 +1019,52 @@ class RunController:
         limit = state.deadline.wall_time_seconds
         if limit <= 0:
             return False
-        started = datetime.fromisoformat(state.deadline.started_at)
-        elapsed = max(0.0, time.time() - started.timestamp())
+        elapsed = self._deadline_elapsed()
         state.counters["elapsed_seconds"] = int(elapsed)
         if elapsed >= limit:
+            terminated: list[str] = []
+            for command in self.commands.recover():
+                if command.get("status") != "running":
+                    continue
+                command_id = str(command.get("id", ""))
+                result = self.commands.terminate(command_id)
+                if result.success:
+                    terminated.append(command_id)
+            if terminated:
+                self.store.append_event(
+                    "deadline_background_commands_terminated",
+                    {"command_ids": terminated},
+                )
             self._restore_best_checkpoint_at_deadline(state)
             state.status = "paused_limit"
-            state.final["limit"] = {"elapsed_seconds": elapsed, "reached_at": utc_now()}
-            self.store.append_event("hard_deadline_reached", state.final["limit"])
-            return True
-        harden_at = limit * (1.0 - state.deadline.harden_fraction)
-        if elapsed >= harden_at and state.phase in {
-            "standard_work",
-            "long_horizon_work",
-        }:
-            state.phase = "final_verify"
-            state.active_work_item_id = None
-            state.final["verification_started_at"] = utc_now()
-            state.final["deadline_hardening"] = {
-                "started_at": utc_now(),
+            state.final["limit"] = {
                 "elapsed_seconds": elapsed,
-                "incomplete_work_items": [
-                    item.id
-                    for item in state.work_items
-                    if item.mandatory and item.status != "accepted"
-                ],
+                "reached_at": utc_now(),
+                "clock": "monotonic_with_persisted_resume",
+                "terminated_command_ids": terminated,
             }
-            self.store.append_event(
-                "deadline_hardening_started", {"elapsed_seconds": elapsed}
-            )
+            self.store.append_event("hard_deadline_reached", state.final["limit"])
             return True
         return False
 
+    def _deadline_elapsed(self) -> float:
+        return self._deadline_elapsed_base + (
+            time.monotonic() - self._deadline_monotonic_started
+        )
+
+    def _deadline_remaining(self, state: RunState) -> float | None:
+        if state.deadline.wall_time_seconds <= 0:
+            return None
+        return state.deadline.wall_time_seconds - self._deadline_elapsed()
+
+    def _model_request_timeout(self, state: RunState) -> float | None:
+        """Let one inference use the remaining task budget instead of a fixed cap."""
+        remaining = self._deadline_remaining(state)
+        return None if remaining is None else max(1.0, remaining)
+
     def _restore_best_checkpoint_at_deadline(self, state: RunState) -> None:
         """Prevent unfinished optimization work from replacing accepted artifacts."""
-        if (
-            not state.profile
-            or state.profile.primary_playbook != "optimization"
-            or not state.profile.requires_best_artifact
-            or not state.best_checkpoint_id
-        ):
+        if not state.best_checkpoint_id:
             return
         checkpoint_path = (
             self.store.checkpoints_dir / f"{state.best_checkpoint_id}.json"

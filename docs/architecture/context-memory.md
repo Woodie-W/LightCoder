@@ -15,7 +15,7 @@ The full transcript is archived but not repeatedly reinjected.
 
 Rotate at a safe tool boundary when any condition holds:
 
-- estimated prompt use crosses the configured fraction of the model window;
+- estimated prompt use leaves fewer than the configured reserve (8,000 tokens by default);
 - the provider reports context exhaustion;
 - a milestone finishes;
 - repeated context indicates plan drift or stagnation;

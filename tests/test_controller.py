@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from lightcoder.controller import RunController
 from lightcoder.model import ModelError, ModelResponse
 from lightcoder.models import TaskProfile, WorkItem
@@ -163,13 +165,39 @@ def test_optimization_deadline_restores_last_accepted_checkpoint(
         estimated_horizon="multi_hour",
         requires_best_artifact=True,
     )
+    with pytest.raises(ValueError, match="evidence id"):
+        controller._checkpoint(
+            state,
+            {
+                "restore_notes": "unvalidated",
+                "metric_name": "score",
+                "metric_value": 1.0,
+                "metric_direction": "maximize",
+                "artifact_paths": ["best.align"],
+            },
+        )
+    controller._execute_tool(
+        state,
+        {"action": "bash", "command": "test -f best.align", "cwd": "."},
+    )
     controller._checkpoint(
         state,
-        {"restore_notes": "accepted best", "artifact_paths": ["best.align"]},
+        {
+            "restore_notes": "accepted best",
+            "metric_name": "score",
+            "metric_value": 1.0,
+            "metric_direction": "maximize",
+            "evidence_ids": [state.evidence_ids[-1]],
+            "artifact_paths": ["best.align"],
+        },
     )
     artifact.write_text("unfinished-losing-candidate\n", encoding="utf-8")
     state.deadline.started_at = "2000-01-01T00:00:00+00:00"
-    state.deadline.wall_time_seconds = 1
+    state.deadline.wall_time_seconds = 60
+
+    # A stale or backward-adjusted wall clock cannot trigger the deadline.
+    assert controller._deadline_transition(state) is False
+    controller._deadline_elapsed_base = 61
 
     assert controller._deadline_transition(state) is True
     assert state.status == "paused_limit"
@@ -177,6 +205,118 @@ def test_optimization_deadline_restores_last_accepted_checkpoint(
     assert "best_checkpoint_restored" in controller.store.events_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_non_improving_checkpoint_does_not_replace_best(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "candidate.txt"
+    artifact.write_text("best\n", encoding="utf-8")
+    controller = RunController.create(
+        "maximize candidate score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.profile = TaskProfile(
+        execution_regime="long_horizon",
+        primary_playbook="optimization",
+        estimated_horizon="multi_hour",
+        requires_best_artifact=True,
+    )
+
+    controller._execute_tool(
+        state,
+        {"action": "bash", "command": "test -f candidate.txt", "cwd": "."},
+    )
+    controller._checkpoint(
+        state,
+        {
+            "restore_notes": "score ten",
+            "metric_name": "score",
+            "metric_value": 10,
+            "metric_direction": "maximize",
+            "evidence_ids": [state.evidence_ids[-1]],
+            "artifact_paths": ["candidate.txt"],
+        },
+    )
+    best_id = state.best_checkpoint_id
+
+    artifact.write_text("worse\n", encoding="utf-8")
+    controller._execute_tool(
+        state,
+        {"action": "bash", "command": "test -f candidate.txt", "cwd": "."},
+    )
+    controller._checkpoint(
+        state,
+        {
+            "restore_notes": "score nine",
+            "metric_name": "score",
+            "metric_value": 9,
+            "metric_direction": "maximize",
+            "evidence_ids": [state.evidence_ids[-1]],
+            "artifact_paths": ["candidate.txt"],
+        },
+    )
+
+    assert state.best_checkpoint_id == best_id
+    controller._restore_best_checkpoint_at_deadline(state)
+    assert artifact.read_text(encoding="utf-8") == "best\n"
+    assert "checkpoint_retained_not_promoted" in (
+        controller.store.events_path.read_text(encoding="utf-8")
+    )
+
+
+def test_hard_deadline_terminates_background_commands(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "stop background work at deadline",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    command = controller.commands.run("sleep 30", background=True)
+    state.deadline.wall_time_seconds = 1
+    controller._deadline_elapsed_base = 2
+
+    assert controller._deadline_transition(state) is True
+    metadata = {
+        item["id"]: item for item in controller.commands.recover()
+    }
+    assert metadata[command.background_id]["status"] == "terminated"
+    assert state.final["limit"]["terminated_command_ids"] == [
+        command.background_id
+    ]
+
+
+def test_controller_does_not_reserve_a_fixed_hardening_fraction(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "continue useful work until the hard deadline",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    state.deadline.wall_time_seconds = 100
+    controller._deadline_elapsed_base = 99
+
+    assert controller._deadline_transition(state) is False
+    assert state.phase == "long_horizon_work"
 
 
 def test_mutation_evidence_cannot_accept_work_item(
@@ -690,7 +830,7 @@ def test_rejections_do_not_trigger_attempt_limit(
     class RejectingModel:
         model = "rejecting"
 
-        def complete(self, messages):
+        def complete(self, messages, *, timeout_seconds=None):
             prompt = "\n".join(message.content for message in messages)
             if "Return profile_task:" in prompt:
                 action = {
@@ -754,7 +894,7 @@ def test_model_failures_schedule_backoff_without_terminating(
     class FailingModel:
         model = "offline"
 
-        def complete(self, messages):
+        def complete(self, messages, *, timeout_seconds=None):
             raise ModelError("temporary outage")
 
     controller = RunController.create(

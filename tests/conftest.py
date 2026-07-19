@@ -21,7 +21,9 @@ class ScriptedModel:
         self.actions = deque(actions)
         self.messages: list[list[ChatMessage]] = []
 
-    def complete(self, messages: list[ChatMessage]) -> ModelResponse:
+    def complete(
+        self, messages: list[ChatMessage], *, timeout_seconds: float | None = None
+    ) -> ModelResponse:
         self.messages.append(messages)
         if not self.actions:
             raise AssertionError("scripted model ran out of actions")
@@ -36,7 +38,9 @@ class CompletingModel:
         self.regime = regime
         self.calls = 0
 
-    def complete(self, messages: list[ChatMessage]) -> ModelResponse:
+    def complete(
+        self, messages: list[ChatMessage], *, timeout_seconds: float | None = None
+    ) -> ModelResponse:
         self.calls += 1
         prompt = "\n".join(message.content for message in messages)
         command_evidence = re.findall(

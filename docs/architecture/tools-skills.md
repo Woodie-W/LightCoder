@@ -2,10 +2,11 @@
 
 ## Minimal Tool Surface
 
-LightCoder exposes three primary workspace tools:
+LightCoder exposes a small primary tool surface:
 
-- `bash`: execute a command with cwd, timeout, output capture, and optional background mode;
+- `bash`: execute a command with cwd, optional timeout, output capture, and optional background mode;
 - `read`: read a bounded UTF-8 file range inside the workspace;
+- `read_command_output`: page through any persisted raw command log by command id and line range;
 - `write`: atomically replace a file inside the workspace.
 
 Search, listing, patching, compilation, and tests are performed through `bash`.
@@ -18,7 +19,7 @@ is intentionally not presented as a security boundary.
 
 Every result includes tool name, call id, success flag, duration, compact output,
 raw-log reference when needed, and any affected paths. Large output is truncated in
-context but preserved on disk.
+context but preserved on disk and recoverable through `read_command_output`.
 
 ## Skill Roles
 

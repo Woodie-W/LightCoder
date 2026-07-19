@@ -255,6 +255,8 @@ class Checkpoint:
     snapshot_path: str = ""
     metric_name: str = ""
     metric_value: float | None = None
+    metric_direction: str = ""
+    validation_evidence_ids: list[str] = field(default_factory=list)
     artifact_paths: list[str] = field(default_factory=list)
 
 
@@ -262,7 +264,9 @@ class Checkpoint:
 class Deadline:
     started_at: str = field(default_factory=utc_now)
     wall_time_seconds: float = 0.0
-    harden_fraction: float = 0.12
+    # Retained for state-file compatibility. The controller no longer takes a
+    # fixed fraction of task time away from implementation for forced hardening.
+    harden_fraction: float = 0.0
 
 
 @dataclass(slots=True)

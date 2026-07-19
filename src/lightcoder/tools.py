@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import tarfile
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -316,34 +317,39 @@ class WorkspaceTools:
 
     def create_checkpoint_snapshot(self, checkpoint_id: str, paths: list[str]) -> str:
         snapshot = self.store.checkpoints_dir / f"{checkpoint_id}.tar.gz"
+        temporary = snapshot.with_name(snapshot.name + ".tmp")
         included: set[str] = set()
-        with tarfile.open(snapshot, "w:gz") as archive:
-            for value in paths:
-                try:
-                    target = self.resolve_path(value)
-                    relative = str(target.relative_to(self.workspace))
-                except (ToolPolicyError, ValueError):
-                    continue
-                if (
-                    relative in included
-                    or not target.exists()
-                    or self._is_runtime_path(target)
-                ):
-                    continue
-                archive.add(
-                    target,
-                    arcname=relative,
-                    recursive=target.is_dir(),
-                    filter=lambda info: (
-                        None
-                        if Path(info.name).parts
-                        and Path(info.name).parts[0] == ".lightcoder"
-                        else info
-                    ),
-                )
-                included.add(relative)
+        try:
+            with tarfile.open(temporary, "w:gz") as archive:
+                for value in paths:
+                    try:
+                        target = self.resolve_path(value)
+                        relative = str(target.relative_to(self.workspace))
+                    except (ToolPolicyError, ValueError):
+                        continue
+                    if (
+                        relative in included
+                        or not target.exists()
+                        or self._is_runtime_path(target)
+                    ):
+                        continue
+                    archive.add(
+                        target,
+                        arcname=relative,
+                        recursive=target.is_dir(),
+                        filter=lambda info: (
+                            None
+                            if Path(info.name).parts
+                            and Path(info.name).parts[0] == ".lightcoder"
+                            else info
+                        ),
+                    )
+                    included.add(relative)
+            if included:
+                os.replace(temporary, snapshot)
+        finally:
+            temporary.unlink(missing_ok=True)
         if not included:
-            snapshot.unlink(missing_ok=True)
             return ""
         return str(snapshot.relative_to(self.store.run_dir))
 
@@ -360,32 +366,51 @@ class WorkspaceTools:
             raise FileNotFoundError(f"checkpoint snapshot not found: {snapshot_path}")
 
         restored: list[str] = []
-        with tarfile.open(snapshot, "r:gz") as archive:
-            for member in archive.getmembers():
-                relative = Path(member.name)
-                if relative.is_absolute() or ".." in relative.parts:
-                    raise ToolPolicyError("unsafe path in checkpoint snapshot")
-                target = (self.workspace / relative).resolve()
-                try:
-                    target.relative_to(self.workspace)
-                except ValueError as error:
-                    raise ToolPolicyError("checkpoint member escapes workspace") from error
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                if not member.isfile():
-                    # Controller snapshots do not need links or device entries;
-                    # ignoring them also prevents link-based path traversal.
-                    continue
-                source = archive.extractfile(member)
-                if source is None:
-                    continue
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=".lightcoder-checkpoint-restore-", dir=self.workspace
+            )
+        )
+        try:
+            staged_files: list[tuple[Path, Path, int, str]] = []
+            with tarfile.open(snapshot, "r:gz") as archive:
+                for member in archive.getmembers():
+                    relative = Path(member.name)
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ToolPolicyError("unsafe path in checkpoint snapshot")
+                    target = (self.workspace / relative).resolve()
+                    try:
+                        target.relative_to(self.workspace)
+                    except ValueError as error:
+                        raise ToolPolicyError(
+                            "checkpoint member escapes workspace"
+                        ) from error
+                    if member.isdir():
+                        continue
+                    if not member.isfile():
+                        continue
+                    source = archive.extractfile(member)
+                    if source is None:
+                        continue
+                    staged = staging / relative
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    with source, staged.open("wb") as destination:
+                        shutil.copyfileobj(source, destination)
+                    os.chmod(staged, member.mode & 0o777)
+                    staged_files.append(
+                        (staged, target, member.mode & 0o777, str(relative))
+                    )
+            # Validate and stage the complete archive before replacing any live
+            # artifact. Each final file replacement is atomic on the workspace
+            # filesystem, so a reader never observes a partially written file.
+            for staged, target, mode, relative in staged_files:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with source, target.open("wb") as destination:
-                    shutil.copyfileobj(source, destination)
-                os.chmod(target, member.mode & 0o777)
-                restored.append(str(relative))
-        return restored
+                os.replace(staged, target)
+                os.chmod(target, mode)
+                restored.append(relative)
+            return restored
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     def _is_runtime_path(self, path: Path) -> bool:
         try:
@@ -418,7 +443,7 @@ class CommandSupervisor:
         command: str,
         *,
         cwd: str = ".",
-        timeout_seconds: float = 1_800,
+        timeout_seconds: float | None = None,
         background: bool = False,
         env: dict[str, str] | None = None,
     ) -> ToolResult:
@@ -450,7 +475,13 @@ class CommandSupervisor:
                 start_new_session=True,
             )
             try:
-                output, _ = process.communicate(timeout=max(0.1, timeout_seconds))
+                output, _ = process.communicate(
+                    timeout=(
+                        max(0.1, timeout_seconds)
+                        if timeout_seconds is not None
+                        else None
+                    )
+                )
                 exit_code = process.returncode
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -556,6 +587,50 @@ class CommandSupervisor:
             return ToolResult(
                 "poll",
                 new_id("poll"),
+                False,
+                time.monotonic() - started,
+                output=str(error),
+            )
+
+    def read_output(
+        self, command_id: str, *, start_line: int = 1, max_lines: int = 400
+    ) -> ToolResult:
+        """Read any range of a command's durable raw log after context truncation."""
+        started = time.monotonic()
+        try:
+            if not command_id.startswith("cmd-") or "/" in command_id:
+                raise ValueError("invalid command id")
+            log_path = self.tools.store.command_log_path(command_id)
+            lines = log_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+            first = max(0, start_line - 1)
+            count = max(1, min(max_lines, 2_000))
+            selected = lines[first : first + count]
+            output = "\n".join(
+                f"{index}: {line}"
+                for index, line in enumerate(selected, first + 1)
+            )
+            if first + len(selected) < len(lines):
+                output += f"\n... truncated; {len(lines)} total lines"
+            return ToolResult(
+                "read_command_output",
+                new_id("log"),
+                True,
+                time.monotonic() - started,
+                output=output,
+                raw_log=str(log_path.relative_to(self.tools.store.run_dir)),
+                background_id=command_id,
+                data={
+                    "command_id": command_id,
+                    "start_line": start_line,
+                    "max_lines": max_lines,
+                },
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            return ToolResult(
+                "read_command_output",
+                new_id("log"),
                 False,
                 time.monotonic() - started,
                 output=str(error),

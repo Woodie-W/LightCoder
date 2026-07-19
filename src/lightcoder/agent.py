@@ -37,13 +37,14 @@ class CodingAgent:
         *,
         core_skill: str | None = None,
         playbook: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AgentDecision:
         messages = self.context.build_messages(
             state, action_contract, core_skill=core_skill, playbook=playbook
         )
         estimate = self.context.estimate_tokens(messages)
         try:
-            response = self.model.complete(messages)
+            response = self.model.complete(messages, timeout_seconds=timeout_seconds)
         except ModelError:
             raise
         self.store.append_transcript(
@@ -59,7 +60,16 @@ class CodingAgent:
             usage=response.usage,
             finish_reason=response.finish_reason,
         )
-        return AgentDecision(self.parse_action(response.content), response, estimate)
+        try:
+            action = self.parse_action(response.content)
+        except ActionError as error:
+            if response.finish_reason == "length":
+                raise ActionError(
+                    "provider exhausted its own output capacity before returning "
+                    "a complete executable action"
+                ) from error
+            raise
+        return AgentDecision(action, response, estimate)
 
     @staticmethod
     def parse_action(content: str) -> dict[str, Any]:
@@ -103,7 +113,6 @@ class CodingAgent:
                 "action": "bash",
                 "command": "\n".join(shell_blocks),
                 "cwd": ".",
-                "timeout_seconds": 1_800,
                 "background": False,
                 "rationale": "Recovered explicitly fenced shell action",
             }

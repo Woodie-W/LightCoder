@@ -80,10 +80,14 @@ ESTABLISH_BASELINE
        |- rejected -> DIAGNOSE_REPLAN
        `- stalled  -> STRATEGY_RESET
   -> DEADLINE_GATE
-       |- continue -> SELECT_READY_ITEM
-       `- harden   -> CONSOLIDATE
+       |- continue      -> SELECT_READY_ITEM
+       `- hard deadline -> RESTORE_BEST_AND_STOP
   -> LONG_HORIZON_VERIFY
 ```
+
+There is no controller-reserved hardening fraction. The agent enters final
+verification after it has relevant passing checks; otherwise useful work may
+continue until the external hard deadline.
 
 The controller promotes a best-known deliverable only when its evidence is tied to
 the exact workspace revision. Engineering tasks preserve the last integrated,

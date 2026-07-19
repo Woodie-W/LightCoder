@@ -76,6 +76,23 @@ def test_background_command_preserves_identity_log_and_exit_code(
     assert "finished" in result.output
 
 
+def test_command_output_can_be_read_by_line_after_context_truncation(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    supervisor = CommandSupervisor(tools)
+    result = supervisor.run(
+        "for i in $(seq 1 40); do printf 'line-%s\\n' \"$i\"; done"
+    )
+
+    recovered = supervisor.read_output(result.call_id, start_line=21, max_lines=3)
+
+    assert recovered.success
+    assert "21: line-21" in recovered.output
+    assert "23: line-23" in recovered.output
+    assert "40 total lines" in recovered.output
+
+
 def test_context_rotation_creates_validated_handoff(
     tmp_path: Path, skills_root: Path
 ) -> None:
@@ -88,6 +105,14 @@ def test_context_rotation_creates_validated_handoff(
     assert context.latest_handoff(state)["workspace_revision_matches"] is True  # type: ignore[index]
     assert (store.handoffs_dir / "0001.json").is_file()
     assert context._recent_transcript(state) == []
+
+
+def test_context_rotation_reserves_only_eight_thousand_tokens(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, _, context = make_runtime(tmp_path, skills_root)
+    assert context.context_window_tokens == 128_000
+    assert context.rotation_threshold_tokens == 120_000
 
 
 def test_context_keeps_static_prefix_before_changing_state_and_compacts_writes(

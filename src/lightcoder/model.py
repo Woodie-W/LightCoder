@@ -31,7 +31,12 @@ class ModelResponse:
 class ModelClient(Protocol):
     model: str
 
-    def complete(self, messages: list[ChatMessage]) -> ModelResponse: ...
+    def complete(
+        self,
+        messages: list[ChatMessage],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ModelResponse: ...
 
 
 class OpenAICompatibleClient:
@@ -41,8 +46,7 @@ class OpenAICompatibleClient:
         base_url: str | None = None,
         model: str | None = None,
         api_key: str | None = None,
-        timeout_seconds: float = 300.0,
-        max_tokens: int = 8_192,
+        timeout_seconds: float | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.base_url = (
@@ -53,17 +57,20 @@ class OpenAICompatibleClient:
             api_key if api_key is not None else os.getenv("LIGHTCODER_API_KEY", "")
         )
         self.timeout_seconds = timeout_seconds
-        self.max_tokens = max_tokens
         self.extra_body = extra_body or {}
 
-    def complete(self, messages: list[ChatMessage]) -> ModelResponse:
+    def complete(
+        self,
+        messages: list[ChatMessage],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ModelResponse:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": message.role, "content": message.content}
                 for message in messages
             ],
-            "max_tokens": self.max_tokens,
             "stream": False,
         }
         body.update(self.extra_body)
@@ -78,10 +85,17 @@ class OpenAICompatibleClient:
             method="POST",
         )
         started = time.monotonic()
+        effective_timeout = (
+            timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        )
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds
-            ) as response:
+            if effective_timeout is None:
+                opened = urllib.request.urlopen(request)
+            else:
+                opened = urllib.request.urlopen(
+                    request, timeout=max(1.0, effective_timeout)
+                )
+            with opened as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")

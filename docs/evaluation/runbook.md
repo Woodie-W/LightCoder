@@ -67,6 +67,6 @@ Join the report with official completion and score fields. At minimum retain:
 
 Report per-task trial values plus aggregate median, dispersion, and success rate.
 Inspect traces for repeated accepted work, stale-evidence rejection, repeated failed
-strategies, context-recovery errors, and deadline hardening behavior. A failed task
+strategies, context-recovery errors, and hard-deadline recovery behavior. A failed task
 with a correct causal trace analysis is evidence; do not replace it with an
 unverified success narrative.

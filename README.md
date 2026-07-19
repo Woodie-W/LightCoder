@@ -27,10 +27,10 @@ single CodingAgent -> OpenAI-compatible model
 - dependency-aware work-item DAG，无固定 attempt/replan 上限
 - 当前 workspace revision 绑定的不可变 evidence
 - mandatory work item 的精确验证命令门和独立 final verification
-- context threshold、milestone 和 provider exhaustion 触发的无限次 episode 轮换
+- 仅剩约 8k token、milestone 和 provider exhaustion 触发的无限次 episode 轮换
 - disk-grounded handoff、完整 transcript 归档和有界上下文重建
-- 前台超时、后台命令、PID 身份校验、日志保留与取消
-- long-horizon 检查点、best artifact 和 deadline hardening
+- 可选前台超时、后台命令、PID 身份校验、可分页日志保留与取消
+- long-horizon 检查点、best artifact 和任务硬截止恢复
 - 14 个按需加载、与 benchmark 无关的英文 skills
 - `report` 生成实验所需的运行、验证和上下文指标
 

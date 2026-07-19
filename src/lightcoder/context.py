@@ -28,7 +28,7 @@ class ContextManager:
         skills: SkillRegistry,
         *,
         context_window_tokens: int = 128_000,
-        rotate_fraction: float = 0.72,
+        rotation_reserve_tokens: int = 8_000,
         transcript_tail: int = 512,
         handoffs_enabled: bool = True,
     ) -> None:
@@ -36,7 +36,11 @@ class ContextManager:
         self.tools = tools
         self.skills = skills
         self.context_window_tokens = max(8_000, context_window_tokens)
-        self.rotate_fraction = min(0.95, max(0.4, rotate_fraction))
+        self.rotation_reserve_tokens = max(1_000, rotation_reserve_tokens)
+        self.rotation_threshold_tokens = max(
+            4_000,
+            self.context_window_tokens - self.rotation_reserve_tokens,
+        )
         self.transcript_tail = max(2, transcript_tail)
         self.handoffs_enabled = handoffs_enabled
 
@@ -81,8 +85,8 @@ class ContextManager:
     def should_rotate(
         self, messages: list[ChatMessage], *, milestone_finished: bool = False
     ) -> bool:
-        return milestone_finished or self.estimate_tokens(messages) >= int(
-            self.context_window_tokens * self.rotate_fraction
+        return milestone_finished or (
+            self.estimate_tokens(messages) >= self.rotation_threshold_tokens
         )
 
     def rotate(
@@ -248,6 +252,8 @@ class ContextManager:
                         else 700
                     )],
                     "command": item.command[:700],
+                    "command_id": item.data.get("command_id")
+                    or item.data.get("tool_call_id"),
                     "exit_code": item.exit_code,
                     "duration_seconds": item.duration_seconds,
                     "raw_log": item.raw_log,

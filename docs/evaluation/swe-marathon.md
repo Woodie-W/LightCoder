@@ -35,7 +35,7 @@ System metrics:
 - accepted progress per hour;
 - repeated-failure and no-progress time;
 - best-artifact regression count;
-- validation coverage and final hardening time.
+- validation coverage and time spent in explicit final verification.
 
 ## Ablations
 
@@ -45,7 +45,7 @@ At minimum compare:
 2. No durable state, transcript-only continuation.
 3. Summary-only compaction without disk-grounded handoff validation.
 4. No long-horizon route, using only the standard loop.
-5. No best-artifact promotion or deadline-aware hardening.
+5. No best-artifact promotion or hard-deadline best restoration.
 
 Implemented experiment flags cover three mechanism-level controls:
 
@@ -57,7 +57,7 @@ Implemented experiment flags cover three mechanism-level controls:
 
 Flags are persisted in run state and emitted by `lightcoder report`, so a resumed
 trial cannot silently change its experimental condition. Additional transcript-only
-or deadline-hardening ablations should be implemented only when that experiment is
+or deadline-policy ablations should be implemented only when that experiment is
 scheduled; they are not simulated by relabeling a normal run.
 
 ## Task-Neutral Interpretation
