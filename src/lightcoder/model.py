@@ -61,6 +61,17 @@ class ModelClient(Protocol):
 
 
 class OpenAICompatibleClient:
+    """Small OpenAI-compatible client with bounded transient-failure retries.
+
+    Retries belong at this transport boundary: they preserve the exact prompt
+    and tool payload and never change controller policy.  A supplied timeout is
+    an end-to-end budget, so retry sleeps and subsequent requests cannot extend
+    the task's wall-clock allowance.
+    """
+
+    _MAX_TRANSIENT_RETRIES = 4
+    _MAX_RETRY_DELAY_SECONDS = 60.0
+
     def __init__(
         self,
         *,
@@ -110,22 +121,50 @@ class OpenAICompatibleClient:
         effective_timeout = (
             timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         )
-        try:
-            if effective_timeout is None:
-                opened = urllib.request.urlopen(request)
-            else:
-                opened = urllib.request.urlopen(
-                    request, timeout=max(1.0, effective_timeout)
+        deadline = (
+            started + effective_timeout if effective_timeout is not None else None
+        )
+        last_error: Exception | None = None
+        for attempt in range(self._MAX_TRANSIENT_RETRIES + 1):
+            request_timeout = self._remaining_timeout(deadline)
+            try:
+                if request_timeout is None:
+                    opened = urllib.request.urlopen(request)
+                else:
+                    opened = urllib.request.urlopen(request, timeout=request_timeout)
+                with opened as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as error:
+                last_error = error
+                detail = error.read().decode("utf-8", errors="replace")
+                if not self._is_transient_http_status(error.code):
+                    raise ModelError(
+                        f"model HTTP {error.code}: {detail[:2_000]}"
+                    ) from error
+                retry_after = self._retry_after_seconds(error)
+                failure = f"model HTTP {error.code}: {detail[:2_000]}"
+            except (urllib.error.URLError, TimeoutError) as error:
+                last_error = error
+                retry_after = None
+                failure = (
+                    "model request failed after "
+                    f"{time.monotonic() - started:.1f}s: {error}"
                 )
-            with opened as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise ModelError(f"model HTTP {error.code}: {detail[:2_000]}") from error
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            raise ModelError(
-                f"model request failed after {time.monotonic() - started:.1f}s: {error}"
-            ) from error
+
+            if attempt >= self._MAX_TRANSIENT_RETRIES:
+                raise ModelError(
+                    f"{failure} (transient retries exhausted)"
+                ) from last_error
+            delay = retry_after if retry_after is not None else min(
+                float(2**attempt), self._MAX_RETRY_DELAY_SECONDS
+            )
+            if not self._sleep_within_deadline(delay, deadline):
+                raise ModelError(
+                    f"{failure} (insufficient remaining time for retry)"
+                ) from last_error
+        else:  # pragma: no cover - the loop always breaks or raises.
+            raise AssertionError("model request retry loop exited unexpectedly")
         try:
             choice = payload["choices"][0]
             message = choice["message"]
@@ -151,3 +190,33 @@ class OpenAICompatibleClient:
             raise ModelError(
                 f"invalid model response: {str(payload)[:2_000]}"
             ) from error
+
+    @staticmethod
+    def _is_transient_http_status(status: int) -> bool:
+        return status == 429 or status in {408, 409, 500, 502, 503, 504}
+
+    @staticmethod
+    def _retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
+        value = error.headers.get("Retry-After") if error.headers else None
+        if value is None:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _remaining_timeout(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelError("model request deadline exhausted")
+        return max(1.0, remaining)
+
+    @staticmethod
+    def _sleep_within_deadline(delay: float, deadline: float | None) -> bool:
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            return False
+        time.sleep(delay)
+        return True
