@@ -142,7 +142,7 @@ def test_context_keeps_static_prefix_before_changing_state_and_compacts_writes(
         playbook="generalist",
     )
     assert "TASK OBJECTIVE\nstable task objective" in messages[0].content
-    assert "ALLOWED ACTIONS" in messages[0].content
+    assert "TOOL POLICY" in messages[0].content
     assert messages[-1].content.startswith("CANONICAL RUN STATE")
     assert "stable task objective" not in messages[-1].content
     assert len(messages[-2].content) < 1_000

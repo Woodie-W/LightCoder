@@ -16,7 +16,26 @@ class ModelError(RuntimeError):
 @dataclass(slots=True)
 class ChatMessage:
     role: str
-    content: str
+    content: str | None = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_id: str = ""
+    name: str = ""
+
+    def to_payload(self) -> dict[str, Any]:
+        """Convert the durable internal representation to Chat Completions form."""
+        payload: dict[str, Any] = {"role": self.role}
+        if self.role == "assistant":
+            payload["content"] = self.content
+            if self.tool_calls:
+                payload["tool_calls"] = self.tool_calls
+        elif self.role == "tool":
+            payload["content"] = self.content or ""
+            payload["tool_call_id"] = self.tool_call_id
+            if self.name:
+                payload["name"] = self.name
+        else:
+            payload["content"] = self.content or ""
+        return payload
 
 
 @dataclass(slots=True)
@@ -26,6 +45,7 @@ class ModelResponse:
     usage: dict[str, int] = field(default_factory=dict)
     finish_reason: str = ""
     provider_payload: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ModelClient(Protocol):
@@ -36,6 +56,7 @@ class ModelClient(Protocol):
         messages: list[ChatMessage],
         *,
         timeout_seconds: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse: ...
 
 
@@ -64,15 +85,16 @@ class OpenAICompatibleClient:
         messages: list[ChatMessage],
         *,
         timeout_seconds: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": [
-                {"role": message.role, "content": message.content}
-                for message in messages
-            ],
+            "messages": [message.to_payload() for message in messages],
             "stream": False,
         }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         body.update(self.extra_body)
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -109,6 +131,9 @@ class OpenAICompatibleClient:
             message = choice["message"]
             content = message.get("content") or ""
             reasoning = message.get("reasoning_content") or ""
+            tool_calls = message.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                raise TypeError("message.tool_calls must be a list")
             usage = {
                 str(key): int(value)
                 for key, value in payload.get("usage", {}).items()
@@ -120,6 +145,7 @@ class OpenAICompatibleClient:
                 usage=usage,
                 finish_reason=str(choice.get("finish_reason", "")),
                 provider_payload=payload,
+                tool_calls=[item for item in tool_calls if isinstance(item, dict)],
             )
         except (KeyError, IndexError, TypeError) as error:
             raise ModelError(

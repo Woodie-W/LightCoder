@@ -28,76 +28,163 @@ from .store import StateStore, default_state_root
 from .tools import CommandSupervisor, ToolResult, WorkspaceTools
 
 
-PROFILE_ACTIONS = """Return profile_task:
-{"action":"profile_task","profile":{"execution_regime":"standard|long_horizon","primary_playbook":"repair|feature|project|transformation|optimization|generalist","estimated_horizon":"short|medium|multi_hour","validation_cost":"low|medium|high","supports_partial_progress":true,"requires_best_artifact":false,"rationale":"observable routing reasons"}}"""
+PROFILE_ACTIONS = """Return profile_task: call the profile_task tool with an observable task classification. Use long_horizon only when the task has a multi-hour search, compilation, or external wait."""
 
-PLAN_ACTIONS = """Return set_plan with a dependency DAG:
-{"action":"set_plan","work_items":[{"id":"W1","title":"...","description":"concrete outcome","kind":"capability|experiment|integration|verification|hardening","playbook":"repair|feature|project|transformation|optimization|generalist","dependencies":[],"mandatory":true,"acceptance":["concrete observable"],"verification_commands":["exact shell command that establishes acceptance"]}]}
-Every mandatory item requires at least one verification command.
-For a multi-hour task, prefer 3-6 substantial vertical milestones rather than one item per file or endpoint. The first milestone must produce a scoreable end-to-end artifact, not only scaffolding.
-Mandatory work items must describe a path to satisfying the objective, including iteration or strategy changes when needed; never make "report/flag failure" the terminal plan for a required outcome.
-Verification commands must be executable in the observed environment. Use python3 rather than python unless a python executable has already been observed. Prefer Python standard-library checks for numeric thresholds instead of assuming utilities such as bc are installed."""
+PLAN_ACTIONS = """Return set_plan: call the set_plan tool with a small dependency DAG. Every mandatory item needs an executable verification command; prefer vertical, scoreable milestones over file-by-file decomposition."""
 
-WORK_ACTIONS = """Return exactly one action:
-{"action":"run","command":"...","cwd":".","timeout_seconds":300,"rationale":"bounded command"}
-{"action":"start","command":"...","cwd":".","rationale":"managed service or long job"}
-{"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
-{"action":"logs","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a managed-job log"}
-{"action":"write","path":"...","content":"...","rationale":"..."}
-{"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
-{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"run","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
-{"action":"poll","command_id":"cmd-..."}
-{"action":"stop","command_id":"cmd-..."}
-{"action":"begin_verification","rationale":"implementation is ready for its acceptance oracle"}
-{"action":"accept_work_item","evidence_ids":["ev-..."],"summary":"why the acceptance criteria pass"}
-{"action":"reject_work_item","evidence_ids":["ev-..."],"failure_signature":"specific observed failure","next_strategy":"materially different next approach"}
-{"action":"revise_plan","work_items":[...],"rationale":"new evidence requiring decomposition change"}
-{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"score","metric_value":0.0,"metric_direction":"maximize|minimize","evidence_ids":["ev-..."],"artifact_paths":[]}
-{"action":"rotate_context","reason":"...","next_action":"..."}
-{"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
-Prefer edit over rewriting an existing file. Prefer batch for independent reads, inspections, and small edits. Prefer one focused bash script over many tiny shell turns.
-run is for bounded commands only: default 300 seconds, maximum 1200 seconds. Never put `&` in a run command. Use start for every server, --stdio process, watch mode, or job expected to run longer than a few minutes; it returns a job id for poll/logs/stop.
-Batch children execute sequentially and may not use start. Never use batch to launch multiple long jobs under the assumption that they run in parallel; start each long job separately and poll it.
-When a known check is needed after a mutation, default to one batch containing the edit/write followed by the focused bash check so both happen in one model turn.
-Keep bash actions short and auditable. For Python logic longer than a few lines, write a named helper script and execute it instead of embedding a large python heredoc or python -c program; this gives syntax-check evidence, preserves reusable instrumentation, and avoids shell/JSON quoting failures.
-Do not reread the same file or repeat the same inspection at an unchanged workspace revision unless the previous observation was truncated and you request a specific unseen range.
-After writing or editing a file, run a focused executable check before changing that same file again. Use the check output to make the next change; do not perform consecutive speculative rewrites.
-For optimization tasks, write experiments to candidate paths. Independently score each candidate and promote it to a required deliverable path only if it improves the recorded best; never let a losing experiment overwrite the best artifact. Microbenchmark a small iteration count before launching a long search.
-Work only on the active work item. Do not implement a downstream work item early. As soon as the active item's implementation appears to satisfy its acceptance criteria, the next action must be begin_verification.
-After begin_verification, the controller runs the exact verification commands automatically. Do not run them repeatedly.
-Do not accept an item without current-revision observational evidence. Use begin_verification before acceptance."""
+WORK_ACTIONS = """Use the provided tools to complete the active work item. Use run only for bounded foreground commands (default 300 seconds, maximum 1200); use start, poll, logs, and stop for services and long jobs. Read before uncertain edits and run a focused check after mutations. Once the acceptance criteria are satisfied, call begin_verification, then accept_work_item with current evidence."""
 
-LONG_HORIZON_ACTIONS = """Return exactly one action:
-{"action":"run","command":"...","cwd":".","timeout_seconds":300,"rationale":"bounded command"}
-{"action":"start","command":"...","cwd":".","rationale":"managed service or long experiment"}
-{"action":"read","path":"...","start_line":1,"max_lines":400,"rationale":"..."}
-{"action":"logs","command_id":"cmd-...","start_line":1,"max_lines":400,"rationale":"inspect a managed-job log"}
-{"action":"write","path":"...","content":"...","rationale":"..."}
-{"action":"edit","path":"...","old":"exact text","new":"replacement","replace_all":false,"rationale":"..."}
-{"action":"batch","actions":[{"action":"read","path":"..."},{"action":"run","command":"..."}],"rationale":"group short sequential operations; maximum 8"}
-{"action":"poll","command_id":"cmd-..."}
-{"action":"stop","command_id":"cmd-..."}
-{"action":"checkpoint","restore_notes":"how to recover this known-good state","metric_name":"score","metric_value":0.0,"metric_direction":"maximize|minimize","evidence_ids":["ev-..."],"artifact_paths":[]}
-{"action":"rotate_context","reason":"...","next_action":"..."}
-{"action":"wait","reason":"specific external event","resume_hint":"how to determine it is ready"}
-{"action":"begin_final_verification","rationale":"all required deliverables are ready for a clean final check"}
-There is no controller-managed work-item plan in long-horizon mode. Keep decomposition advisory and freely change strategy from observations; never wait for an artificial milestone before working on another part of the objective.
-Create a valid scoreable baseline for every required deliverable early. Then allocate effort by measured correctness or metric gain per wall-clock time.
-Treat required deliverable paths as promoted best-so-far artifacts. Run experiments on candidate paths, independently score them, and atomically promote only verified improvements. Checkpoint all currently valid required deliverables together after a material improvement.
-Every checkpoint requires successful current-revision command evidence. For optimization checkpoints, provide a numeric metric and its minimize/maximize direction; the controller retains a non-improving snapshot as history but does not replace the best checkpoint.
-run is for bounded commands only: default 300 seconds, maximum 1200 seconds. Never put `&` in a run command. Start independent long jobs as separate start actions, then poll/logs/stop them. Microbenchmark before a long search and leave time for final verification.
-Prefer edit over rewriting an existing file. Keep bash actions short and auditable. Put nontrivial Python logic in a named helper file rather than a heredoc or large python -c command.
-Do not reread unchanged files or repeat failed experiments without a materially different hypothesis. Use rotate_context for a compact handoff when history grows.
-Use begin_final_verification only after running relevant checks and confirming required artifacts exist. Continue useful implementation and testing until then; the controller does not reserve a fixed hardening fraction."""
+LONG_HORIZON_ACTIONS = """Use the provided tools to make measured progress toward a scoreable artifact. Keep decomposition advisory, preserve the best valid artifact, and use checkpoints after verified improvements. Long work must use start/poll/logs/stop; run is only for bounded foreground checks. Call begin_final_verification only after relevant checks succeed."""
 
-FINAL_VERIFY_ACTIONS = """Run final integration checks with run/read, or return:
-{"action":"final_verified","evidence_ids":["ev-..."],"summary":"why all mandatory outcomes and regressions pass","risks":["..."]}
-You may also use rotate_context. final_verified requires successful current-revision command evidence."""
+FINAL_VERIFY_ACTIONS = """Use run, read, and the provided tools for final integration checks. Call final_verified only with successful current-revision command evidence."""
 
-DELIVER_ACTIONS = """Return final_delivery only:
-{"action":"final_delivery","summary":"concise delivered outcome","tests":["..."],"changed_files":["..."],"risks":["..."]}"""
+DELIVER_ACTIONS = """Call final_delivery with the verified outcome, tests, changed files, and remaining risks."""
 
 TERMINAL_STATUSES = {"completed", "paused_limit", "failed_infra", "cancelled"}
+
+
+def _tool_schema(
+    name: str,
+    description: str,
+    properties: dict[str, Any] | None = None,
+    required: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties or {},
+                "required": required or [],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def native_tool_schemas(phase: str) -> list[dict[str, Any]]:
+    """Native Chat Completions tools exposed for one controller phase.
+
+    The tool names deliberately match the durable controller actions.  This keeps
+    tool results and old checkpoints inspectable while moving the model boundary
+    from text-parsed JSON to the OpenAI/DeepSeek function-calling protocol.
+    """
+    text = {"type": "string"}
+    integer = {"type": "integer"}
+    number = {"type": "number"}
+    boolean = {"type": "boolean"}
+    object_value = {"type": "object", "additionalProperties": True}
+    array = {"type": "array", "items": object_value}
+    common_tools = [
+        _tool_schema(
+            "run",
+            "Run a bounded foreground shell command. Default 300 seconds; maximum 1200 seconds. Never use this for a service, watch mode, or long experiment.",
+            {"command": text, "cwd": text, "timeout_seconds": number, "rationale": text},
+            ["command"],
+        ),
+        _tool_schema(
+            "start",
+            "Start a managed long-running job or service. Returns a command id; inspect it with poll or logs and terminate it with stop.",
+            {"command": text, "cwd": text, "rationale": text},
+            ["command"],
+        ),
+        _tool_schema(
+            "poll",
+            "Return current managed-job status without reading its full output.",
+            {"command_id": text},
+            ["command_id"],
+        ),
+        _tool_schema(
+            "logs",
+            "Read a bounded range of output from a managed job.",
+            {"command_id": text, "start_line": integer, "max_lines": integer, "rationale": text},
+            ["command_id"],
+        ),
+        _tool_schema(
+            "stop",
+            "Terminate a managed job and its process group.",
+            {"command_id": text},
+            ["command_id"],
+        ),
+        _tool_schema(
+            "read",
+            "Read a bounded line range from a workspace file.",
+            {"path": text, "start_line": integer, "max_lines": integer, "rationale": text},
+            ["path"],
+        ),
+        _tool_schema(
+            "write",
+            "Atomically create or replace a workspace file.",
+            {"path": text, "content": text, "rationale": text},
+            ["path", "content"],
+        ),
+        _tool_schema(
+            "edit",
+            "Replace exact text in a workspace file. Use read first when the target text is uncertain.",
+            {"path": text, "old": text, "new": text, "replace_all": boolean, "rationale": text},
+            ["path", "old", "new"],
+        ),
+        _tool_schema(
+            "rotate_context",
+            "Create a compact durable handoff before a new strategy or when history is large.",
+            {"reason": text, "next_action": text},
+            ["reason"],
+        ),
+    ]
+    if phase == "recon":
+        return [
+            _tool_schema(
+                "profile_task",
+                "Classify task horizon and playbook so the controller can route it.",
+                {"profile": object_value},
+                ["profile"],
+            )
+        ]
+    if phase == "plan":
+        return [
+            _tool_schema(
+                "set_plan",
+                "Set a dependency-aware plan for a standard task.",
+                {"work_items": array},
+                ["work_items"],
+            )
+        ]
+    if phase == "deliver":
+        return [
+            _tool_schema(
+                "final_delivery",
+                "Record the verified delivery and finish the task.",
+                {"summary": text, "tests": {"type": "array", "items": text}, "changed_files": {"type": "array", "items": text}, "risks": {"type": "array", "items": text}},
+                ["summary", "tests", "changed_files", "risks"],
+            )
+        ]
+    if phase == "final_verify":
+        return common_tools + [
+            _tool_schema(
+                "final_verified",
+                "Mark final verification complete using current successful evidence.",
+                {"evidence_ids": {"type": "array", "items": text}, "summary": text, "risks": {"type": "array", "items": text}},
+                ["evidence_ids", "summary"],
+            )
+        ]
+    if phase == "standard_work":
+        return common_tools + [
+            _tool_schema("begin_verification", "Ask the controller to run the active item's acceptance commands.", {"rationale": text}),
+            _tool_schema("accept_work_item", "Accept the verified active work item with evidence.", {"evidence_ids": {"type": "array", "items": text}, "summary": text}, ["evidence_ids", "summary"]),
+            _tool_schema("reject_work_item", "Record a failed approach and a materially different next strategy.", {"evidence_ids": {"type": "array", "items": text}, "failure_signature": text, "next_strategy": text}, ["failure_signature", "next_strategy"]),
+            _tool_schema("revise_plan", "Replace remaining plan work items after new evidence.", {"work_items": array, "rationale": text}, ["work_items"]),
+            _tool_schema("checkpoint", "Save validated progress and optional scalar metric.", {"restore_notes": text, "metric_name": text, "metric_value": number, "metric_direction": text, "evidence_ids": {"type": "array", "items": text}, "artifact_paths": {"type": "array", "items": text}}, ["restore_notes", "evidence_ids"]),
+            _tool_schema("wait", "Pause only while a managed job is running.", {"reason": text, "resume_hint": text}, ["reason"]),
+        ]
+    if phase == "long_horizon_work":
+        return common_tools + [
+            _tool_schema("checkpoint", "Save validated progress and optional scalar metric.", {"restore_notes": text, "metric_name": text, "metric_value": number, "metric_direction": text, "evidence_ids": {"type": "array", "items": text}, "artifact_paths": {"type": "array", "items": text}}, ["restore_notes", "evidence_ids"]),
+            _tool_schema("begin_final_verification", "Move to final verification after all deliverables are ready.", {"rationale": text}),
+            _tool_schema("wait", "Pause only while a managed job is running.", {"reason": text, "resume_hint": text}, ["reason"]),
+        ]
+    return common_tools
 
 
 class ControllerError(RuntimeError):
@@ -337,12 +424,54 @@ class RunController:
                 core_skill=core_skill,
                 playbook=playbook,
                 timeout_seconds=self._model_request_timeout(state),
+                tools=native_tool_schemas(state.phase),
             )
             state.counters["consecutive_model_errors"] = 0
             state.retry_at = ""
             if state.episodes:
                 state.episodes[-1].token_estimate = decision.prompt_tokens_estimate
-            self._apply_action(state, decision.action)
+            # Providers may return a small sequence of independent tool calls in
+            # one response.  Execute them in order, exactly as their tool result
+            # messages will be replayed on the next model call.  Restrict control
+            # actions to one per turn so a stale parallel plan cannot skip a
+            # controller phase transition.
+            if len(decision.actions) > 8:
+                raise ActionError("model returned more than 8 tool calls in one turn")
+            for index, action in enumerate(decision.actions):
+                if index and str(action.get("action")) in {
+                    "profile_task",
+                    "set_plan",
+                    "begin_verification",
+                    "accept_work_item",
+                    "reject_work_item",
+                    "revise_plan",
+                    "begin_final_verification",
+                    "final_verified",
+                    "final_delivery",
+                    "wait",
+                }:
+                    raise ActionError(
+                        "controller-transition tools must be the only call in a response"
+                    )
+                self._apply_action(state, action)
+                if (
+                    str(action.get("_tool_call_id", ""))
+                    and str(action.get("action", ""))
+                    not in {
+                        "bash",
+                        "run",
+                        "start",
+                        "read",
+                        "read_command_output",
+                        "logs",
+                        "write",
+                        "edit",
+                        "poll",
+                        "terminate",
+                        "stop",
+                    }
+                ):
+                    self._record_control_tool_result(state, action)
         except ModelError as error:
             failures = state.counters.get("consecutive_model_errors", 0) + 1
             state.counters["consecutive_model_errors"] = failures
@@ -674,6 +803,25 @@ class RunController:
         self.store.append_event(
             "tool_result", {"evidence_id": evidence.id, **result.to_dict()}
         )
+        tool_call_id = str(action.get("_tool_call_id", ""))
+        if tool_call_id:
+            self.store.append_transcript(
+                "tool",
+                json.dumps(
+                    {
+                        "success": result.success,
+                        "output": result.output,
+                        "exit_code": result.exit_code,
+                        "duration_seconds": result.duration_seconds,
+                        "command_id": result.background_id or result.data.get("command_id", ""),
+                        "evidence_id": evidence.id,
+                    },
+                    ensure_ascii=False,
+                ),
+                kind="tool_result",
+                tool_call_id=tool_call_id,
+                name=str(action.get("action", result.tool)),
+            )
         if str(action["action"]) in {"write", "edit"} and result.success:
             automatic_command = self._automatic_mutation_check(
                 str(action.get("path", ""))
@@ -702,6 +850,26 @@ class RunController:
                     "automatic_mutation_check",
                     {"evidence_id": check_evidence.id, **check_result.to_dict()},
                 )
+
+    def _record_control_tool_result(
+        self, state: RunState, action: dict[str, Any]
+    ) -> None:
+        """Close the native tool-call protocol for controller-only actions."""
+        self.store.append_transcript(
+            "tool",
+            json.dumps(
+                {
+                    "success": True,
+                    "phase": state.phase,
+                    "status": state.status,
+                    "message": "controller action accepted",
+                },
+                ensure_ascii=False,
+            ),
+            kind="tool_result",
+            tool_call_id=str(action["_tool_call_id"]),
+            name=str(action.get("action", "")),
+        )
 
     def _tool_evidence(
         self, state: RunState, result: ToolResult, action: dict[str, Any]

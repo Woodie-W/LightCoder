@@ -22,7 +22,11 @@ class ScriptedModel:
         self.messages: list[list[ChatMessage]] = []
 
     def complete(
-        self, messages: list[ChatMessage], *, timeout_seconds: float | None = None
+        self,
+        messages: list[ChatMessage],
+        *,
+        timeout_seconds: float | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> ModelResponse:
         self.messages.append(messages)
         if not self.actions:
@@ -39,17 +43,26 @@ class CompletingModel:
         self.calls = 0
 
     def complete(
-        self, messages: list[ChatMessage], *, timeout_seconds: float | None = None
+        self,
+        messages: list[ChatMessage],
+        *,
+        timeout_seconds: float | None = None,
+        tools: list[dict[str, object]] | None = None,
     ) -> ModelResponse:
         self.calls += 1
-        prompt = "\n".join(message.content for message in messages)
+        prompt = "\n".join(message.content or "" for message in messages)
+        tool_names = {
+            str(item.get("function", {}).get("name", ""))
+            for item in tools or []
+            if isinstance(item, dict)
+        }
         command_evidence = re.findall(
             r'"id": "(ev-[^"]+)"(?:(?!"id":).){0,1400}?"kind": "command"'
             r'(?:(?!"id":).){0,1400}?"exit_code": 0',
             prompt,
             re.S,
         )
-        if "Return profile_task:" in prompt:
+        if "profile_task" in tool_names:
             action = {
                 "action": "profile_task",
                 "profile": {
@@ -64,7 +77,7 @@ class CompletingModel:
                     "rationale": "one observable capability",
                 },
             }
-        elif "Return set_plan" in prompt:
+        elif "set_plan" in tool_names:
             action = {
                 "action": "set_plan",
                 "work_items": [
@@ -81,7 +94,7 @@ class CompletingModel:
                     }
                 ],
             }
-        elif "Return final_delivery only" in prompt:
+        elif "final_delivery" in tool_names:
             action = {
                 "action": "final_delivery",
                 "summary": "marker delivered",
@@ -89,7 +102,7 @@ class CompletingModel:
                 "changed_files": ["marker.txt"],
                 "risks": [],
             }
-        elif "Run final integration checks" in prompt:
+        elif "final_verified" in tool_names:
             final_commands = re.findall(
                 r'"id": "(ev-[^"]+)"(?:(?!"id":).){0,1400}?"kind": "command"'
                 r'(?:(?!"id":).){0,1400}?"work_item_id": null',
@@ -117,7 +130,7 @@ class CompletingModel:
                 else {"action": "bash", "command": "test -f marker.txt"}
             )
         elif (
-            '"action":"begin_final_verification"' in prompt
+            "begin_final_verification" in tool_names
             and (self.workspace / "marker.txt").exists()
         ):
             action = {
@@ -128,7 +141,16 @@ class CompletingModel:
             action = {"action": "write", "path": "marker.txt", "content": "ok\n"}
         else:
             action = {"action": "begin_verification", "rationale": "ready"}
-        return ModelResponse(json.dumps(action))
+        return ModelResponse(
+            "",
+            tool_calls=[
+                {
+                    "id": f"call-{self.calls}",
+                    "type": "function",
+                    "function": {"name": action["action"], "arguments": json.dumps({k: v for k, v in action.items() if k != "action"})},
+                }
+            ],
+        )
 
 
 @pytest.fixture

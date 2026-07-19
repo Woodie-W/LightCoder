@@ -138,8 +138,8 @@ def test_long_horizon_bypasses_plan_generation(
     assert state.active_work_item_id is None
     assert len(model.messages) == 2
     flat_prompt = "\n".join(message.content for message in model.messages[1])
-    assert '"action":"begin_final_verification"' in flat_prompt
-    assert '"action":"start"' in flat_prompt
+    assert "TOOL POLICY" in flat_prompt
+    assert "start/poll/logs/stop" in flat_prompt
     assert "Return set_plan" not in flat_prompt
     events = controller.store.events_path.read_text(encoding="utf-8")
     assert "flat_long_horizon_started" in events

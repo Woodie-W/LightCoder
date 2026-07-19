@@ -15,6 +15,29 @@ def test_parse_action_uses_first_complete_json_object() -> None:
     }
 
 
+def test_parse_native_tool_calls_preserves_call_identity() -> None:
+    actions = CodingAgent.parse_tool_calls(
+        [
+            {
+                "id": "call_read_1",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": '{"path":"src/main.py","max_lines":80}',
+                },
+            }
+        ]
+    )
+    assert actions == [
+        {
+            "action": "read",
+            "path": "src/main.py",
+            "max_lines": 80,
+            "_tool_call_id": "call_read_1",
+        }
+    ]
+
+
 def test_parse_action_recovers_fenced_bash() -> None:
     action = CodingAgent.parse_action(
         "I will run the check.\n\n```bash\npython3 /app/check.py\n```"

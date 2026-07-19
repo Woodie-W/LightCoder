@@ -14,10 +14,10 @@ from .tools import WorkspaceTools
 
 SYSTEM_CONTRACT = """You are the only reasoning agent in LightCoder. Work directly on the target repository.
 The deterministic controller owns routing, persistence, deadlines, and completion guards.
-Return exactly one JSON object matching an allowed action. Never wrap it in Markdown.
+Use the provided function tools for every action. Do not emit JSON action objects, shell fences, or a prose description in place of a tool call.
 Use evidence, not confidence, to claim completion. Do not stop because a strategy failed.
 Do not modify runtime metadata or harness-protected paths. Treat disk and tool results as authoritative.
-Keep private reasoning private; put only a concise rationale in the JSON action."""
+Keep private reasoning private; tool arguments should contain only the information needed to execute the action."""
 
 
 class ContextManager:
@@ -58,7 +58,7 @@ class ContextManager:
         system_sections = [
             SYSTEM_CONTRACT,
             f"TASK OBJECTIVE\n{state.objective}",
-            f"ALLOWED ACTIONS\n{action_contract}",
+            f"TOOL POLICY\n{action_contract}",
         ]
         if core_skill:
             system_sections.append(
@@ -80,7 +80,7 @@ class ContextManager:
         return messages
 
     def estimate_tokens(self, messages: list[ChatMessage]) -> int:
-        return sum(max(1, len(message.content) // 4) + 6 for message in messages)
+        return sum(max(1, len(message.content or "") // 4) + 6 for message in messages)
 
     def should_rotate(
         self, messages: list[ChatMessage], *, milestone_finished: bool = False
@@ -376,7 +376,25 @@ class ContextManager:
                         if metadata.get("kind") == "controller_context"
                         else self._compact_transcript_content(role, raw_content)
                     )
-                    messages.append(ChatMessage(role, content))
+                    tool_calls = metadata.get("tool_calls", [])
+                    messages.append(
+                        ChatMessage(
+                            role,
+                            content,
+                            tool_calls=tool_calls if isinstance(tool_calls, list) else [],
+                        )
+                    )
+                    if len(messages) >= self.transcript_tail:
+                        break
+                elif role == "tool":
+                    messages.append(
+                        ChatMessage(
+                            "tool",
+                            str(value.get("content", "")),
+                            tool_call_id=str(metadata.get("tool_call_id", "")),
+                            name=str(metadata.get("name", "")),
+                        )
+                    )
                     if len(messages) >= self.transcript_tail:
                         break
             except json.JSONDecodeError:

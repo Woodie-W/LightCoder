@@ -17,9 +17,14 @@ class ActionError(ValueError):
 
 @dataclass(slots=True)
 class AgentDecision:
-    action: dict[str, Any]
+    actions: list[dict[str, Any]]
     response: ModelResponse
     prompt_tokens_estimate: int
+
+    @property
+    def action(self) -> dict[str, Any]:
+        """Compatibility view for callers that expect one action per turn."""
+        return self.actions[0]
 
 
 class CodingAgent:
@@ -38,13 +43,16 @@ class CodingAgent:
         core_skill: str | None = None,
         playbook: str | None = None,
         timeout_seconds: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AgentDecision:
         messages = self.context.build_messages(
             state, action_contract, core_skill=core_skill, playbook=playbook
         )
         estimate = self.context.estimate_tokens(messages)
         try:
-            response = self.model.complete(messages, timeout_seconds=timeout_seconds)
+            response = self._complete(
+                messages, timeout_seconds=timeout_seconds, tools=tools
+            )
         except ModelError:
             raise
         self.store.append_transcript(
@@ -59,17 +67,65 @@ class CodingAgent:
             model=self.model.model,
             usage=response.usage,
             finish_reason=response.finish_reason,
+            tool_calls=response.tool_calls,
         )
+        if response.tool_calls:
+            actions = self.parse_tool_calls(response.tool_calls)
+        else:
+            # Keep old saved trajectories and lightweight test doubles runnable,
+            # but normal providers are instructed and configured to use tools.
+            try:
+                actions = [self.parse_action(response.content)]
+            except ActionError as error:
+                if response.finish_reason == "length":
+                    raise ActionError(
+                        "provider exhausted its own output capacity before returning "
+                        "a complete tool call"
+                    ) from error
+                raise ActionError("model returned no tool call") from error
+        return AgentDecision(actions, response, estimate)
+
+    def _complete(
+        self,
+        messages: list[Any],
+        *,
+        timeout_seconds: float | None,
+        tools: list[dict[str, Any]] | None,
+    ) -> ModelResponse:
         try:
-            action = self.parse_action(response.content)
-        except ActionError as error:
-            if response.finish_reason == "length":
-                raise ActionError(
-                    "provider exhausted its own output capacity before returning "
-                    "a complete executable action"
-                ) from error
-            raise
-        return AgentDecision(action, response, estimate)
+            return self.model.complete(
+                messages, timeout_seconds=timeout_seconds, tools=tools
+            )
+        except TypeError as error:
+            # Backward compatibility for local scripted models.  Network clients
+            # implement the tools argument and never take this branch.
+            if "tools" not in str(error) or "unexpected" not in str(error):
+                raise
+            return self.model.complete(messages, timeout_seconds=timeout_seconds)
+
+    @staticmethod
+    def parse_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+        for call in tool_calls:
+            function = call.get("function")
+            if not isinstance(function, dict):
+                raise ActionError("tool call has no function object")
+            name = function.get("name")
+            arguments = function.get("arguments", "{}")
+            if not isinstance(name, str) or not name:
+                raise ActionError("tool call has no function name")
+            try:
+                parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except json.JSONDecodeError as error:
+                raise ActionError(f"invalid arguments for {name}: {error}") from error
+            if not isinstance(parsed, dict):
+                raise ActionError(f"arguments for {name} must be an object")
+            action = {"action": name, **parsed}
+            action["_tool_call_id"] = str(call.get("id", ""))
+            actions.append(action)
+        if not actions:
+            raise ActionError("model returned an empty tool call list")
+        return actions
 
     @staticmethod
     def parse_action(content: str) -> dict[str, Any]:
