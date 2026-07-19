@@ -76,6 +76,23 @@ def test_background_command_preserves_identity_log_and_exit_code(
     assert "finished" in result.output
 
 
+def test_managed_job_has_an_independent_timeout_watchdog(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    supervisor = CommandSupervisor(tools)
+    started = supervisor.start("sleep 10", timeout_seconds=0.05)
+    assert started.success
+    deadline = time.monotonic() + 2
+    while True:
+        result = supervisor.poll(started.background_id)
+        if result.data.get("status") == "exited":
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    assert result.exit_code == 124
+
+
 def test_run_does_not_hang_on_accidental_background_descendant(
     tmp_path: Path, skills_root: Path
 ) -> None:

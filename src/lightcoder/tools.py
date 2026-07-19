@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -543,6 +544,7 @@ class CommandSupervisor:
         *,
         cwd: str = ".",
         env: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ToolResult:
         """Start a managed long-running job and immediately return its id."""
         started = time.monotonic()
@@ -557,7 +559,13 @@ class CommandSupervisor:
             process_env = os.environ.copy()
             process_env.update(env or {})
             return self._start_background(
-                command_id, command, workdir, log_path, process_env, started
+                command_id,
+                command,
+                workdir,
+                log_path,
+                process_env,
+                started,
+                timeout_seconds=timeout_seconds,
             )
         except (OSError, ToolPolicyError) as error:
             return ToolResult(
@@ -572,11 +580,27 @@ class CommandSupervisor:
         log_path: Path,
         env: dict[str, str],
         started: float,
+        *,
+        timeout_seconds: float | None,
     ) -> ToolResult:
+        bounded_timeout = (
+            max(1.0, float(timeout_seconds))
+            if timeout_seconds is not None
+            else None
+        )
+        launched_command = command
+        if bounded_timeout is not None:
+            # The wrapper is deliberately inside the managed process group.  It
+            # survives a controller crash and enforces the task's own remaining
+            # wall-time, rather than inventing a short limit for valid searches.
+            launched_command = (
+                "timeout --signal=TERM --kill-after=15s "
+                f"{bounded_timeout:.3f}s /bin/bash -lc {shlex.quote(command)}"
+            )
         log_handle = log_path.open("w", encoding="utf-8")
         try:
             process = subprocess.Popen(
-                command,
+                launched_command,
                 cwd=workdir,
                 env=env,
                 shell=True,
@@ -597,6 +621,7 @@ class CommandSupervisor:
             "started_at": utc_now(),
             "status": "running",
             "log": str(log_path.relative_to(self.tools.store.run_dir)),
+            "timeout_seconds": bounded_timeout,
         }
         self._write_metadata(command_id, metadata)
         return ToolResult(
@@ -607,7 +632,11 @@ class CommandSupervisor:
             output=f"managed job started with pid {process.pid}",
             raw_log=metadata["log"],
             background_id=command_id,
-            data={"pid": process.pid, "status": "running"},
+            data={
+                "pid": process.pid,
+                "status": "running",
+                "timeout_seconds": bounded_timeout,
+            },
         )
 
     def poll(self, command_id: str) -> ToolResult:

@@ -86,8 +86,8 @@ def native_tool_schemas(phase: str) -> list[dict[str, Any]]:
         ),
         _tool_schema(
             "start",
-            "Start a managed long-running job or service. Returns a command id; inspect it with poll or logs and terminate it with stop.",
-            {"command": text, "cwd": text, "rationale": text},
+            "Start a managed long-running job or service. It is independently stopped at the task's remaining wall-time (or an earlier timeout_seconds); inspect it with poll or logs and terminate it with stop.",
+            {"command": text, "cwd": text, "timeout_seconds": number, "rationale": text},
             ["command"],
         ),
         _tool_schema(
@@ -176,13 +176,11 @@ def native_tool_schemas(phase: str) -> list[dict[str, Any]]:
             _tool_schema("reject_work_item", "Record a failed approach and a materially different next strategy.", {"evidence_ids": {"type": "array", "items": text}, "failure_signature": text, "next_strategy": text}, ["failure_signature", "next_strategy"]),
             _tool_schema("revise_plan", "Replace remaining plan work items after new evidence.", {"work_items": array, "rationale": text}, ["work_items"]),
             _tool_schema("checkpoint", "Save validated progress and optional scalar metric.", {"restore_notes": text, "metric_name": text, "metric_value": number, "metric_direction": text, "evidence_ids": {"type": "array", "items": text}, "artifact_paths": {"type": "array", "items": text}}, ["restore_notes", "evidence_ids"]),
-            _tool_schema("wait", "Pause only while a managed job is running.", {"reason": text, "resume_hint": text}, ["reason"]),
         ]
     if phase == "long_horizon_work":
         return common_tools + [
             _tool_schema("checkpoint", "Save validated progress and optional scalar metric.", {"restore_notes": text, "metric_name": text, "metric_value": number, "metric_direction": text, "evidence_ids": {"type": "array", "items": text}, "artifact_paths": {"type": "array", "items": text}}, ["restore_notes", "evidence_ids"]),
             _tool_schema("begin_final_verification", "Move to final verification after all deliverables are ready.", {"rationale": text}),
-            _tool_schema("wait", "Pause only while a managed job is running.", {"reason": text, "resume_hint": text}, ["reason"]),
         ]
     return common_tools
 
@@ -733,6 +731,7 @@ class RunController:
                 result = self.commands.start(
                     str(action.get("command", "")),
                     cwd=str(action.get("cwd", ".")),
+                    timeout_seconds=self._managed_job_timeout(state, action),
                 )
                 self._record_tool_result(state, action, result)
                 return
@@ -760,6 +759,7 @@ class RunController:
             result = self.commands.start(
                 str(action.get("command", "")),
                 cwd=str(action.get("cwd", ".")),
+                timeout_seconds=self._managed_job_timeout(state, action),
             )
         elif name == "read":
             self._require_new_read_range(state, action)
@@ -841,6 +841,7 @@ class RunController:
                     timeout_seconds=60,
                     background=False,
                 )
+
                 check_evidence = self._tool_evidence(state, check_result, check_action)
                 self.store.record_evidence(check_evidence)
                 state.evidence_ids.append(check_evidence.id)
@@ -850,6 +851,22 @@ class RunController:
                     "automatic_mutation_check",
                     {"evidence_id": check_evidence.id, **check_result.to_dict()},
                 )
+
+    def _managed_job_timeout(
+        self, state: RunState, action: dict[str, Any]
+    ) -> float | None:
+        """Bound a background job by the official task budget, not a short cap."""
+        requested = action.get("timeout_seconds")
+        requested_value = (
+            max(1.0, float(requested)) if requested is not None else None
+        )
+        remaining = self._deadline_remaining(state)
+        if remaining is None:
+            return requested_value
+        # Leave a small fixed window for final polling, verifier handoff, and
+        # controller-side process cleanup.  This is not a per-command limit.
+        task_bound = max(1.0, remaining - 30.0)
+        return min(requested_value, task_bound) if requested_value else task_bound
 
     def _record_control_tool_result(
         self, state: RunState, action: dict[str, Any]
