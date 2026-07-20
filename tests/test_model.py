@@ -8,7 +8,12 @@ import urllib.request
 
 import pytest
 
-from lightcoder.model import ChatMessage, ModelError, OpenAICompatibleClient
+from lightcoder.model import (
+    ChatMessage,
+    ModelError,
+    OpenAICompatibleClient,
+    PermanentModelError,
+)
 
 
 def test_openai_compatible_request_omits_client_output_limit(monkeypatch) -> None:
@@ -215,7 +220,7 @@ def test_model_client_does_not_retry_permanent_http_errors(monkeypatch) -> None:
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     client = OpenAICompatibleClient(base_url="https://example.invalid/v1")
 
-    with pytest.raises(ModelError, match="HTTP 401"):
+    with pytest.raises(PermanentModelError, match="HTTP 401"):
         client.complete([ChatMessage("user", "continue")])
     assert attempts == 1
 

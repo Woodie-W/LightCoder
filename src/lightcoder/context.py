@@ -399,4 +399,43 @@ class ContextManager:
                         break
             except json.JSONDecodeError:
                 continue
-        return list(reversed(messages))
+        return self._complete_tool_call_history(list(reversed(messages)))
+
+    @staticmethod
+    def _complete_tool_call_history(
+        messages: list[ChatMessage],
+    ) -> list[ChatMessage]:
+        """Keep native tool calls and their results as indivisible bundles."""
+        complete: list[ChatMessage] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            if message.role == "tool":
+                index += 1
+                continue
+            if message.role != "assistant" or not message.tool_calls:
+                complete.append(message)
+                index += 1
+                continue
+
+            expected = {
+                str(call.get("id", ""))
+                for call in message.tool_calls
+                if isinstance(call, dict) and str(call.get("id", ""))
+            }
+            results: list[ChatMessage] = []
+            cursor = index + 1
+            while cursor < len(messages) and messages[cursor].role == "tool":
+                results.append(messages[cursor])
+                cursor += 1
+            observed = [result.tool_call_id for result in results]
+            if (
+                expected
+                and len(expected) == len(message.tool_calls)
+                and len(observed) == len(expected)
+                and set(observed) == expected
+            ):
+                complete.append(message)
+                complete.extend(results)
+            index = cursor
+        return complete

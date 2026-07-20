@@ -141,6 +141,58 @@ def test_context_rotation_reserves_only_eight_thousand_tokens(
     assert context.rotation_threshold_tokens == 120_000
 
 
+def test_recent_transcript_drops_orphan_and_incomplete_tool_calls(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    state, store, _, context = make_runtime(tmp_path, skills_root)
+    store.append_transcript(
+        "tool", "orphan", tool_call_id="orphan", name="read"
+    )
+    store.append_transcript(
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "incomplete",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"},
+            }
+        ],
+    )
+    store.append_transcript("user", "continue")
+
+    messages = context._recent_transcript(state)
+
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "continue")
+    ]
+
+
+def test_recent_transcript_preserves_complete_parallel_tool_call_bundle(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    state, store, _, context = make_runtime(tmp_path, skills_root)
+    calls = [
+        {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "read", "arguments": "{}"},
+        }
+        for call_id in ("call-a", "call-b")
+    ]
+    store.append_transcript("assistant", "", tool_calls=calls)
+    store.append_transcript("tool", "a", tool_call_id="call-a", name="read")
+    store.append_transcript("tool", "b", tool_call_id="call-b", name="read")
+
+    messages = context._recent_transcript(state)
+
+    assert [message.role for message in messages] == ["assistant", "tool", "tool"]
+    assert [message.tool_call_id for message in messages[1:]] == [
+        "call-a",
+        "call-b",
+    ]
+
+
 def test_context_keeps_static_prefix_before_changing_state_and_compacts_writes(
     tmp_path: Path, skills_root: Path
 ) -> None:

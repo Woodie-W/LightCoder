@@ -66,6 +66,20 @@ def test_work_item_normalizes_work_kinds_used_as_playbooks(
     assert item.playbook == expected
 
 
+def test_work_item_keeps_string_criteria_as_one_entry() -> None:
+    item = WorkItem.from_dict(
+        {
+            "id": "W1",
+            "title": "Milestone",
+            "description": "Complete a milestone",
+            "acceptance": "one complete acceptance criterion",
+            "verification_commands": "pytest -q",
+        }
+    )
+    assert item.acceptance == ["one complete acceptance criterion"]
+    assert item.verification_commands == ["pytest -q"]
+
+
 def test_state_store_uses_optimistic_revisions(tmp_path: Path) -> None:
     state = RunState.create("persistent", tmp_path / "workspace")
     (tmp_path / "workspace").mkdir()

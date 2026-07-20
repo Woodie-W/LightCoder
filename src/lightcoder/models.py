@@ -98,6 +98,14 @@ def normalize_playbook(value: Any) -> str:
     return PLAYBOOK_ALIASES.get(raw, raw)
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -189,14 +197,14 @@ class WorkItem:
             kind=kind_aliases.get(raw_kind, raw_kind),
             playbook=normalize_playbook(value.get("playbook")),  # type: ignore[arg-type]
             status=str(value.get("status", "pending")),  # type: ignore[arg-type]
-            dependencies=[str(x) for x in value.get("dependencies", [])],
+            dependencies=_string_list(value.get("dependencies", [])),
             mandatory=bool(value.get("mandatory", True)),
-            acceptance=[str(x) for x in value.get("acceptance", []) if str(x).strip()],
-            verification_commands=[
-                str(x) for x in value.get("verification_commands", []) if str(x).strip()
-            ],
-            evidence_ids=[str(x) for x in value.get("evidence_ids", [])],
-            failure_signatures=[str(x) for x in value.get("failure_signatures", [])],
+            acceptance=_string_list(value.get("acceptance", [])),
+            verification_commands=_string_list(
+                value.get("verification_commands", [])
+            ),
+            evidence_ids=_string_list(value.get("evidence_ids", [])),
+            failure_signatures=_string_list(value.get("failure_signatures", [])),
             attempt_count=max(0, int(value.get("attempt_count", 0))),
         )
         item.validate()

@@ -13,6 +13,10 @@ class ModelError(RuntimeError):
     pass
 
 
+class PermanentModelError(ModelError):
+    """A request the provider rejected and retrying unchanged cannot fix."""
+
+
 @dataclass(slots=True)
 class ChatMessage:
     role: str
@@ -139,7 +143,7 @@ class OpenAICompatibleClient:
                 last_error = error
                 detail = error.read().decode("utf-8", errors="replace")
                 if not self._is_transient_http_status(error.code):
-                    raise ModelError(
+                    raise PermanentModelError(
                         f"model HTTP {error.code}: {detail[:2_000]}"
                     ) from error
                 retry_after = self._retry_after_seconds(error)

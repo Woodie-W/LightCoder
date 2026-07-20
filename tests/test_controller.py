@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from lightcoder.controller import RunController
-from lightcoder.model import ModelError, ModelResponse
+from lightcoder.model import ModelError, ModelResponse, PermanentModelError
 from lightcoder.models import TaskProfile, WorkItem
 from lightcoder.reporting import build_run_report
 
@@ -37,6 +37,11 @@ def test_controller_completes_full_single_agent_flow(
     assert report["commands_passed"] == 2
     assert report["context_episodes"] == 2
     assert report["context_rotations"] == 1
+    transcript = [
+        json.loads(line)
+        for line in controller.store.transcript_path.read_text().splitlines()
+    ]
+    assert transcript[state.episodes[0].transcript_end - 1]["role"] == "tool"
 
 
 def test_long_horizon_uses_flat_flow_without_work_items(
@@ -59,6 +64,40 @@ def test_long_horizon_uses_flat_flow_without_work_items(
     assert build_run_report(controller.store)["control_mode"] == "flat"
     events = controller.store.events_path.read_text(encoding="utf-8")
     assert "flat_long_horizon_started" in events
+
+
+def test_multi_hour_deadline_uses_flat_flow_even_if_model_profiles_short(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "official multi-hour task",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.deadline.wall_time_seconds = 18_000
+
+    controller._apply_action(
+        state,
+        {
+            "action": "profile_task",
+            "profile": {
+                "execution_regime": "standard",
+                "primary_playbook": "generalist",
+                "estimated_horizon": "short",
+                "validation_cost": "low",
+                "rationale": "model guessed short",
+            },
+        },
+    )
+
+    assert state.phase == "long_horizon_work"
+    assert state.profile.execution_regime == "long_horizon"  # type: ignore[union-attr]
+    assert state.profile.estimated_horizon == "multi_hour"  # type: ignore[union-attr]
 
 
 def test_optimization_profile_always_requires_best_artifact(
@@ -1011,6 +1050,32 @@ def test_model_failures_schedule_backoff_without_terminating(
     assert state.retry_at
     assert state.counters["model_calls"] == 1
     assert state.counters["consecutive_model_errors"] == 1
+
+
+def test_permanent_model_failure_stops_without_exponential_retries(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class RejectedModel:
+        model = "rejected"
+
+        def complete(self, messages, *, timeout_seconds=None, tools=None):
+            raise PermanentModelError("model HTTP 400: invalid tool history")
+
+    controller = RunController.create(
+        "reject invalid requests",
+        workspace,
+        RejectedModel(),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.step()
+
+    assert state.status == "failed_infra"
+    assert not state.retry_at
+    assert state.counters["model_calls"] == 1
 
 
 def test_ablation_configuration_changes_mechanism_and_persists(

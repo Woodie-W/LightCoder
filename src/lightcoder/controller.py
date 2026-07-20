@@ -11,7 +11,7 @@ from typing import Any
 
 from .agent import ActionError, CodingAgent
 from .context import ContextManager
-from .model import ModelClient, ModelError
+from .model import ModelClient, ModelError, PermanentModelError
 from .models import (
     Checkpoint,
     Evidence,
@@ -438,7 +438,7 @@ class RunController:
             for index, action in enumerate(decision.actions):
                 current_action = action
                 remaining_actions = decision.actions[index + 1 :]
-                if index and str(action.get("action")) in {
+                if str(action.get("action")) in {
                     "profile_task",
                     "set_plan",
                     "begin_verification",
@@ -449,7 +449,8 @@ class RunController:
                     "final_verified",
                     "final_delivery",
                     "wait",
-                }:
+                    "rotate_context",
+                } and (index or remaining_actions):
                     raise ActionError(
                         "controller-transition tools must be the only call in a response"
                     )
@@ -472,6 +473,17 @@ class RunController:
                     }
                 ):
                     self._record_control_tool_result(state, action)
+                self._rotate_after_control_tool_result(state, action)
+        except PermanentModelError as error:
+            state.status = "failed_infra"
+            state.final["model_error"] = {
+                "error": str(error),
+                "kind": "permanent_request_error",
+            }
+            self.store.append_event(
+                "model_failure_terminal",
+                {"error": str(error), "kind": "permanent_request_error"},
+            )
         except ModelError as error:
             failures = state.counters.get("consecutive_model_errors", 0) + 1
             state.counters["consecutive_model_errors"] = failures
@@ -530,6 +542,10 @@ class RunController:
             # deliverable, which is especially damaging in long-running benchmarks.
             if state.profile.primary_playbook == "optimization":
                 state.profile.requires_best_artifact = True
+            if state.deadline.wall_time_seconds >= 3_600:
+                state.profile.execution_regime = "long_horizon"
+                state.profile.estimated_horizon = "multi_hour"
+                state.profile.rationale += " [controller: multi-hour task budget]"
             if "standard-only" in state.runtime_config.get("ablations", []):
                 state.profile.execution_regime = "standard"
                 state.profile.rationale += " [ablation: standard-only]"
@@ -627,11 +643,6 @@ class RunController:
             self.store.append_event(
                 "work_item_accepted", {"work_item_id": item.id, "evidence_ids": ids}
             )
-            self.context.rotate(
-                state,
-                reason="milestone_finished",
-                next_action="select next ready work item",
-            )
             return
         if name == "reject_work_item" and state.phase == "standard_work":
             item = self._active(state)
@@ -664,11 +675,6 @@ class RunController:
             self._checkpoint(state, action)
             return
         if name == "rotate_context" and state.phase != "done":
-            self.context.rotate(
-                state,
-                reason=str(action.get("reason", "agent_requested")),
-                next_action=str(action.get("next_action", "")),
-            )
             return
         if name == "begin_final_verification" and state.phase == "long_horizon_work":
             state.phase = "final_verify"
@@ -904,6 +910,24 @@ class RunController:
             tool_call_id=str(action["_tool_call_id"]),
             name=str(action.get("action", "")),
         )
+
+    def _rotate_after_control_tool_result(
+        self, state: RunState, action: dict[str, Any]
+    ) -> None:
+        """Rotate only after the assistant/tool protocol pair is durable."""
+        name = str(action.get("action", ""))
+        if name == "accept_work_item":
+            self.context.rotate(
+                state,
+                reason="milestone_finished",
+                next_action="select next ready work item",
+            )
+        elif name == "rotate_context":
+            self.context.rotate(
+                state,
+                reason=str(action.get("reason", "agent_requested")),
+                next_action=str(action.get("next_action", "")),
+            )
 
     def _record_rejected_tool_call(
         self, state: RunState, action: dict[str, Any], error: str
