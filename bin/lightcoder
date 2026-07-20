@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+exec "${LIGHTCODER_PYTHON:-python3}" -m lightcoder.cli "$@"

@@ -33,6 +33,7 @@ single CodingAgent -> OpenAI-compatible model
 - long-horizon 检查点、best artifact 和任务硬截止恢复
 - 14 个按需加载、与 benchmark 无关的英文 skills
 - `report` 生成实验所需的运行、验证和上下文指标
+- 可选的 CORAL 风格命令式评测，支持 Agent 自编评测器、指标版本和历史比较
 
 ## Install
 
@@ -61,6 +62,18 @@ lightcoder run \
   --wall-time 4h \
   --watch
 ```
+
+需要让 Agent 自行构建和管理中间评测时，增加 `--managed-eval`。这只暴露
+可选命令，不改变原有工具循环：
+
+```bash
+lightcoder eval
+lightcoder log
+lightcoder show A0001
+lightcoder checkout A0001
+```
+
+评测器约定见 [`docs/evaluation/managed-evaluation.md`](docs/evaluation/managed-evaluation.md)。
 
 `--watch` 把结构化事件输出到 stderr；最终 canonical state 输出到 stdout。`run_id` 会在启动时立即打印。
 

@@ -8,7 +8,7 @@ external task workspaces and model credentials.
 
 | Requirement | Implementation | Verification |
 |---|---|---|
-| Minimal agent loop | One `CodingAgent`, JSON action protocol, OpenAI-compatible client, `bash/read/write` tools | End-to-end scripted-model test |
+| Minimal agent loop | One `CodingAgent`, native tool calling, OpenAI-compatible client, bounded and managed shell tools | End-to-end scripted-model test |
 | Autonomous multi-hour execution | Persistent `RunController`, resumable state, foreground/background commands, deadlines, retry backoff | Controller, command timeout, resume-state tests |
 | Task state management | Validated task profile and dependency-aware work-item DAG | Cycle rejection, ready-selection, unlimited rejection tests |
 | Context management | Bounded episode transcript, structured handoff, disk/revision validation, unlimited rotations | Handoff and milestone-rotation tests |
@@ -19,6 +19,7 @@ external task workspaces and model credentials.
 | No attempt cap | Attempt counters are telemetry; failures return to ready work with a new strategy | Repeated rejection test beyond eight attempts |
 | Experiment ablations | `standard-only`, `no-handoffs`, and `no-checkpoints` persisted in run config | Ablation persistence and behavior test |
 | Experiment telemetry | `lightcoder report` emits time, calls, commands, failures, rotations, completion, and best checkpoint | Report assertions in controller tests |
+| Optional managed evaluation | CORAL-style `eval/log/show/checkout`, agent-authored evaluator, evaluator hashes, fixed-commit grading | Evaluator success, failure, comparison, state exclusion, and restore tests |
 
 ## Implemented Boundaries
 
@@ -26,6 +27,8 @@ external task workspaces and model credentials.
 - No agent framework, LLM supervisor, worker hierarchy, or model-driven state
   transition authority remains.
 - Runtime and skill routing do not inspect benchmark or task names.
+- Managed evaluation is opt-in. Its evaluator is an editable optimization proxy;
+  the hidden official benchmark evaluator remains external and authoritative.
 - `read`, `write`, cwd, runtime metadata, and explicit protected paths are policy
   checked. Arbitrary `bash` commands rely on the surrounding container or OS user
   boundary.
@@ -40,13 +43,11 @@ conda run -n auto-research python tools/build_coding_agent_skills.py --build-zip
 conda run -n auto-research python -m pip wheel --no-build-isolation --no-deps .
 ```
 
-The current suite contains fifteen tests. The wheel inspection confirms that all
-fourteen skills and the manifest are installed with the package.
+The current suite contains 76 tests. The wheel inspection confirms that all fourteen
+skills and the manifest are installed with the package.
 
 ## External Experiment Status
 
-No official SWE-Marathon score is claimed yet. The selected task workspaces are not
-present under `/data/auto-research`, and an official run also requires the task
-images, evaluator access, fixed model configuration, resource limits, and multiple
-trials. Once those assets are available, follow the experiment runbook and append
-measured results rather than estimates to the evaluation document.
+Official benchmark runs and measured scores are maintained by the external Harbor
+experiment workspace. This repository documents the runtime and adapters; follow
+the experiment runbook and keep measured results separate from proxy evaluations.

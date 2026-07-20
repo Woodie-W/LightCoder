@@ -246,17 +246,25 @@ class RunController:
         protected_paths: list[Path] | None = None,
         context_window_tokens: int = 128_000,
         ablations: list[str] | None = None,
+        managed_evaluation: bool = False,
     ) -> "RunController":
         workspace = workspace.resolve()
         if not workspace.is_dir():
             raise FileNotFoundError(f"workspace does not exist: {workspace}")
+        root = (state_root or default_state_root(workspace)).expanduser().resolve()
         state = RunState.create(
             objective,
             workspace,
             wall_time_seconds=wall_time_seconds,
             runtime_config={"ablations": sorted(set(ablations or []))},
         )
-        store = StateStore.create(state_root or default_state_root(workspace), state)
+        if managed_evaluation:
+            state.runtime_config["managed_evaluation"] = {
+                "enabled": True,
+                "store": str(root / "runs" / state.run_id / "evaluations"),
+                "local_check_hint_shown": False,
+            }
+        store = StateStore.create(root, state)
         return cls(
             store,
             model,
@@ -755,6 +763,7 @@ class RunController:
                     str(action.get("command", "")),
                     cwd=str(action.get("cwd", ".")),
                     timeout_seconds=self._managed_job_timeout(state, action),
+                    env=self._managed_evaluation_env(state),
                 )
                 self._record_tool_result(state, action, result)
                 return
@@ -777,12 +786,14 @@ class RunController:
                 command,
                 cwd=str(action.get("cwd", ".")),
                 timeout_seconds=timeout_seconds,
+                env=self._managed_evaluation_env(state),
             )
         elif name == "start":
             result = self.commands.start(
                 str(action.get("command", "")),
                 cwd=str(action.get("cwd", ".")),
                 timeout_seconds=self._managed_job_timeout(state, action),
+                env=self._managed_evaluation_env(state),
             )
         elif name == "read":
             self._require_new_read_range(state, action)
@@ -863,6 +874,7 @@ class RunController:
                     cwd=".",
                     timeout_seconds=60,
                     background=False,
+                    env=self._managed_evaluation_env(state),
                 )
 
                 check_evidence = self._tool_evidence(state, check_result, check_action)
@@ -874,6 +886,60 @@ class RunController:
                     "automatic_mutation_check",
                     {"evidence_id": check_evidence.id, **check_result.to_dict()},
                 )
+        self._maybe_remind_managed_evaluation(state, action, result)
+
+    def _managed_evaluation_env(self, state: RunState) -> dict[str, str] | None:
+        config = state.runtime_config.get("managed_evaluation", {})
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return None
+        return {
+            "LIGHTCODER_EVAL_STORE": str(config["store"]),
+            "LIGHTCODER_EVAL_WORKSPACE": state.workspace,
+            "LIGHTCODER_STATE_ROOT": str(self.store.root),
+            "LIGHTCODER_RUN_ID": state.run_id,
+            "LIGHTCODER_MODEL": self.agent.model.model,
+        }
+
+    def _maybe_remind_managed_evaluation(
+        self, state: RunState, action: dict[str, Any], result: ToolResult
+    ) -> None:
+        config = state.runtime_config.get("managed_evaluation", {})
+        if (
+            not isinstance(config, dict)
+            or not config.get("enabled")
+            or config.get("local_check_hint_shown")
+            or str(action.get("action", "")) not in {"bash", "run"}
+        ):
+            return
+        command = str(action.get("command", "")).lower()
+        if "lightcoder eval" in command:
+            return
+        test_markers = (
+            "pytest",
+            "cargo test",
+            "go test",
+            "npm test",
+            "npm run test",
+            "pnpm test",
+            "yarn test",
+            "ctest",
+            "test.sh",
+            "benchmark",
+        )
+        if not any(marker in command for marker in test_markers):
+            return
+        config["local_check_hint_shown"] = True
+        self.store.append_transcript(
+            "user",
+            "This was recorded as a local check. If managed comparison is useful, "
+            "you may create `.lightcoder-eval/evaluate.py` and `metrics.toml`, then "
+            "run `lightcoder eval`. It is optional.",
+            kind="controller_feedback",
+        )
+        self.store.append_event(
+            "managed_evaluation_hint_shown",
+            {"command": str(action.get("command", "")), "success": result.success},
+        )
 
     def _managed_job_timeout(
         self, state: RunState, action: dict[str, Any]

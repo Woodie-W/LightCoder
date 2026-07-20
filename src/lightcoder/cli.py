@@ -9,6 +9,15 @@ from pathlib import Path
 from typing import Sequence
 
 from .controller import RunController
+from .evaluation import (
+    evaluation_store,
+    find_attempt,
+    format_attempt,
+    format_log,
+    load_attempts,
+    restore_attempt,
+    submit_evaluation,
+)
 from .model import OpenAICompatibleClient
 from .reporting import build_run_report
 from .store import StateStore, default_state_root, discover_runs
@@ -59,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--wall-time", type=parse_duration, default=0.0, metavar="DURATION"
     )
+    run.add_argument(
+        "--managed-eval",
+        action="store_true",
+        help="advertise the optional command-based evaluation loop to the agent",
+    )
     _add_runtime_options(run, ablations=True)
 
     resume = subparsers.add_parser("resume", help="resume a persistent run")
@@ -87,12 +101,58 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = subparsers.add_parser("list", help="list persistent runs")
     _add_state_location_options(listing)
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="commit and evaluate the current solution and evaluator",
+        description="""Commit the current workspace and run the editable managed evaluator.
+
+Create .lightcoder-eval/evaluate.py. It runs with the submitted workspace as
+its working directory and must print a JSON object on its final non-empty line:
+  {"metrics": {"partial": 0.5}, "test_points": []}
+
+Create .lightcoder-eval/metrics.toml:
+  primary = "partial"
+  timeout_seconds = 600
+  [metrics.partial]
+  direction = "maximize"
+
+Changing either file automatically creates a new evaluator version. Scores are
+only compared when evaluator version, primary metric, and direction all match.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    eval_parser.add_argument("-m", "--message", default="")
+    _add_evaluation_location_options(eval_parser)
+
+    eval_log = subparsers.add_parser("log", help="list managed evaluation attempts")
+    _add_evaluation_location_options(eval_log)
+    eval_log.add_argument("--json", action="store_true")
+
+    show = subparsers.add_parser("show", help="show one managed evaluation attempt")
+    show.add_argument("attempt_id")
+    _add_evaluation_location_options(show)
+
+    checkout = subparsers.add_parser(
+        "checkout", help="restore the clean workspace snapshot from an attempt"
+    )
+    checkout.add_argument("attempt_id")
+    _add_evaluation_location_options(checkout)
     return parser
 
 
 def _add_state_location_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--state-root", type=Path)
+
+
+def _add_evaluation_location_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path(os.getenv("LIGHTCODER_EVAL_WORKSPACE", Path.cwd())),
+    )
+    parser.add_argument("--store", type=Path)
 
 
 def _add_runtime_options(
@@ -183,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 protected_paths=args.protected_path,
                 context_window_tokens=args.context_window,
                 ablations=args.ablation,
+                managed_evaluation=args.managed_eval,
             )
             if args.watch:
                 controller.store.event_sink = _print_event
@@ -216,6 +277,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             state = _controller(args).cancel(args.reason)
         elif args.command == "list":
             print(json.dumps(discover_runs(_state_root(args)), indent=2))
+            return 0
+        elif args.command == "eval":
+            record = submit_evaluation(
+                args.workspace, store=args.store, message=args.message
+            )
+            print(format_attempt(record))
+            return 0 if record.get("status") == "completed" else 1
+        elif args.command == "log":
+            attempts = load_attempts(evaluation_store(args.workspace, args.store))
+            print(
+                json.dumps(attempts, ensure_ascii=False, indent=2)
+                if args.json
+                else format_log(attempts)
+            )
+            return 0
+        elif args.command == "show":
+            attempt = find_attempt(
+                evaluation_store(args.workspace, args.store), args.attempt_id
+            )
+            print(json.dumps(attempt, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        elif args.command == "checkout":
+            attempt = restore_attempt(
+                args.workspace, args.attempt_id, store=args.store
+            )
+            print(
+                f"restored {attempt['id']} from commit {attempt['commit']}; "
+                "HEAD was not moved"
+            )
             return 0
         else:
             parser.error(f"unknown command: {args.command}")

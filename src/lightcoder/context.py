@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
+from .evaluation import evaluation_summary
 from .model import ChatMessage
 from .models import Episode, RunState, utc_now
 from .skills import SkillRegistry
@@ -18,6 +20,9 @@ Use the provided function tools for every action. Do not emit JSON action object
 Use evidence, not confidence, to claim completion. Do not stop because a strategy failed.
 Do not modify runtime metadata or harness-protected paths. Treat disk and tool results as authoritative.
 Keep private reasoning private; tool arguments should contain only the information needed to execute the action."""
+
+MANAGED_EVALUATION_CONTRACT = """OPTIONAL MANAGED EVALUATION
+When useful, write an evaluator in `.lightcoder-eval/evaluate.py` and metric definitions in `.lightcoder-eval/metrics.toml`, then invoke `lightcoder eval` through the run tool. It commits the current code and evaluator, runs that fixed revision, and compares only results produced by the same evaluator version. Ordinary tests remain valid local checks. This mechanism is optional; use `lightcoder eval --help` for the compact file contract."""
 
 
 class ContextManager:
@@ -60,6 +65,8 @@ class ContextManager:
             f"TASK OBJECTIVE\n{state.objective}",
             f"TOOL POLICY\n{action_contract}",
         ]
+        if self._managed_evaluation_config(state):
+            system_sections.append(MANAGED_EVALUATION_CONTRACT)
         if core_skill:
             system_sections.append(
                 f"CORE SKILL: {core_skill}\n{self.skills.load(core_skill)}"
@@ -116,6 +123,7 @@ class ContextManager:
                 if item.status == "accepted"
             ],
             "best_checkpoint_id": state.best_checkpoint_id,
+            "managed_evaluation": self._managed_evaluation_status(state),
             "recent_evidence_ids": state.evidence_ids[-20:],
             "failed_strategies": {
                 item.id: item.failure_signatures[-5:]
@@ -233,6 +241,7 @@ class ContextManager:
                 for item in state.work_items
             ],
             "best_checkpoint_id": state.best_checkpoint_id,
+            "managed_evaluation": self._managed_evaluation_status(state),
             "workspace_revision": self.tools.workspace_revision(),
             "recent_evidence": [
                 {
@@ -264,6 +273,20 @@ class ContextManager:
         }
         return "CANONICAL RUN STATE\n" + json.dumps(
             compact, ensure_ascii=False, indent=2
+        )
+
+    @staticmethod
+    def _managed_evaluation_config(state: RunState) -> dict[str, Any] | None:
+        value = state.runtime_config.get("managed_evaluation")
+        return value if isinstance(value, dict) and value.get("enabled") else None
+
+    def _managed_evaluation_status(self, state: RunState) -> dict[str, Any] | None:
+        config = self._managed_evaluation_config(state)
+        if config is None:
+            return None
+        return evaluation_summary(
+            self.tools.workspace,
+            Path(str(config["store"])),
         )
 
     @staticmethod

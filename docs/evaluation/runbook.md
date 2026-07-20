@@ -14,7 +14,9 @@ experiment configuration and report.
 3. Put `.lightcoder` state outside the submitted workspace.
 4. Use the same model endpoint, model identifier, context window, and sampling
    configuration for every compared condition.
-5. Verify that the evaluator cannot be modified or inspected by the agent.
+5. Verify that the hidden official evaluator cannot be modified or inspected by
+   the agent. An optional agent-authored proxy evaluator is separate and must be
+   labelled as managed rather than official.
 
 ## Conditions
 

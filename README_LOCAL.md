@@ -52,7 +52,8 @@ bash /data/benchmarks/LightCoder/lightcoder.sh run \
 
 - 提交工作区和 `state-root` 分离
 - 每个任务单独一个 `state-root`
-- 继续沿用官方评测容器 / 官方任务工作区，不要让 agent 直接写评测器本体
+- 继续沿用官方评测容器 / 官方任务工作区；隐藏官方评测器保持不可见，
+  Agent 只可在启用 `--managed-eval` 时编写 `.lightcoder-eval/` 代理评测器
 
 ## 本地长任务优化
 

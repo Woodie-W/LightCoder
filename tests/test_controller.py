@@ -44,6 +44,55 @@ def test_controller_completes_full_single_agent_flow(
     assert transcript[state.episodes[0].transcript_end - 1]["role"] == "tool"
 
 
+def test_managed_evaluation_is_optional_and_reminds_after_first_local_test(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "optional evaluation",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    messages = controller.context.build_messages(
+        state, "Use tools", core_skill="profile-task"
+    )
+    assert "OPTIONAL MANAGED EVALUATION" in messages[0].content
+
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python -m pytest --version",
+            "cwd": ".",
+        },
+    )
+
+    config = state.runtime_config["managed_evaluation"]
+    assert config["local_check_hint_shown"] is True
+    transcript = controller.store.transcript_path.read_text(encoding="utf-8")
+    assert "recorded as a local check" in transcript
+
+    plain_workspace = tmp_path / "plain-workspace"
+    plain_workspace.mkdir()
+    plain = RunController.create(
+        "plain run",
+        plain_workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "plain-state",
+        skills_root=skills_root,
+    )
+    plain_state = plain.store.load()
+    plain_messages = plain.context.build_messages(
+        plain_state, "Use tools", core_skill="profile-task"
+    )
+    assert "OPTIONAL MANAGED EVALUATION" not in plain_messages[0].content
+
+
 def test_long_horizon_uses_flat_flow_without_work_items(
     tmp_path: Path, skills_root: Path
 ) -> None:

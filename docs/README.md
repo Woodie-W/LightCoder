@@ -13,8 +13,9 @@ and continue for hours.
 5. [Tools and skills](architecture/tools-skills.md)
 6. [SWE-Marathon evaluation](evaluation/swe-marathon.md)
 7. [Experiment runbook](evaluation/runbook.md)
-8. [Implementation status](implementation-status.md)
-9. [Usage](usage.md)
+8. [Optional managed evaluation](evaluation/managed-evaluation.md)
+9. [Implementation status](implementation-status.md)
+10. [Usage](usage.md)
 
 ## Authority
 

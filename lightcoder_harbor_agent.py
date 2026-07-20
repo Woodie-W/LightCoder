@@ -205,6 +205,8 @@ else
   PYTHON_BIN={shlex.quote(remote_runtime)}/bin/python3
 fi
 export PYTHONPATH={escaped_remote_src}/src
+export LIGHTCODER_PYTHON="$PYTHON_BIN"
+export PATH={escaped_remote_src}/bin:$PATH
 STATUS=0
 "$PYTHON_BIN" -m lightcoder.cli run {escaped_instruction} \
   --workspace {escaped_workspace} \
@@ -214,6 +216,7 @@ STATUS=0
   --base-url {shlex.quote(base_url)} \
   --model {shlex.quote(model)} \
   --context-window 128000 \
+  --managed-eval \
   --watch \
   > {escaped_final_state_path} 2> >(stdbuf -oL tee {escaped_output_path} >&2) || STATUS=$?
 RUN_ID="$(find {escaped_state_root}/runs -mindepth 1 -maxdepth 1 -type d | sort | tail -n1 | xargs -r basename || true)"
@@ -268,5 +271,6 @@ exit "$STATUS"
             "commands_failed": report.get("commands_failed"),
             "commands_passed": report.get("commands_passed"),
             "attempts": report.get("attempts"),
+            "managed_evaluation": report.get("managed_evaluation"),
             "phase": report.get("phase"),
         }

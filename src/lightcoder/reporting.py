@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 import json
+from pathlib import Path
 from typing import Any
 
+from .evaluation import evaluation_summary
 from .store import StateStore
 
 
@@ -18,6 +20,16 @@ def build_run_report(store: StateStore) -> dict[str, Any]:
     updated = datetime.fromisoformat(state.updated_at)
     usage: Counter[str] = Counter()
     successful_model_responses = 0
+    managed_config = state.runtime_config.get("managed_evaluation", {})
+    managed_evaluation = (
+        evaluation_summary(
+            Path(state.workspace), Path(str(managed_config["store"]))
+        )
+        if isinstance(managed_config, dict)
+        and managed_config.get("enabled")
+        and managed_config.get("store")
+        else None
+    )
     if store.transcript_path.is_file():
         for line in store.transcript_path.read_text(
             encoding="utf-8", errors="replace"
@@ -67,5 +79,6 @@ def build_run_report(store: StateStore) -> dict[str, Any]:
         "commands_failed": sum(item.exit_code not in {0, None} for item in commands),
         "command_duration_seconds": sum(item.duration_seconds for item in commands),
         "best_checkpoint_id": state.best_checkpoint_id,
+        "managed_evaluation": managed_evaluation,
         "final": state.final,
     }
