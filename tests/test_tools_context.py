@@ -49,17 +49,24 @@ def test_command_timeout_terminates_process_group(
     assert "timed out" in result.output
 
 
-def test_broad_interpreter_kill_is_rejected_before_it_can_kill_the_agent(
+def test_unmanaged_process_termination_is_rejected_before_it_can_kill_the_agent(
     tmp_path: Path, skills_root: Path
 ) -> None:
     _, _, tools, _ = make_runtime(tmp_path, skills_root)
     supervisor = CommandSupervisor(tools)
 
-    result = supervisor.run("pkill -9 -f python || true")
-    started = supervisor.start("killall python3")
+    commands = [
+        "pkill -9 -f python || true",
+        "killall python3",
+        "for pid in /proc/[0-9]*; do kill -9 \"$pid\"; done",
+        "python3 -c 'import os; os.kill(1, 9)'",
+    ]
 
-    assert not result.success and "generic Python" in result.output
-    assert not started.success and "generic Python" in started.output
+    for command in commands:
+        result = supervisor.run(command)
+        assert not result.success and "direct process termination" in result.output
+    started = supervisor.start("killall python3")
+    assert not started.success and "direct process termination" in started.output
 
 
 def test_edit_requires_an_unambiguous_exact_match(

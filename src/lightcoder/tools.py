@@ -465,7 +465,7 @@ class CommandSupervisor:
         try:
             if not command.strip():
                 raise ToolPolicyError("command must not be empty")
-            self._reject_broad_interpreter_kill(command)
+            self._reject_unmanaged_process_termination(command)
             workdir = self.tools.resolve_path(cwd)
             if not workdir.is_dir():
                 raise ToolPolicyError(f"cwd is not a directory: {cwd}")
@@ -554,7 +554,7 @@ class CommandSupervisor:
         try:
             if not command.strip():
                 raise ToolPolicyError("command must not be empty")
-            self._reject_broad_interpreter_kill(command)
+            self._reject_unmanaged_process_termination(command)
             workdir = self.tools.resolve_path(cwd)
             if not workdir.is_dir():
                 raise ToolPolicyError(f"cwd is not a directory: {cwd}")
@@ -653,31 +653,24 @@ class CommandSupervisor:
         )
 
     @staticmethod
-    def _reject_broad_interpreter_kill(command: str) -> None:
-        """Keep a shell cleanup from terminating the resident agent process."""
-        generic = re.compile(r"\^?python(?:3(?:\.\d+)?)?(?:\.\*)?\$?$")
-        for segment in re.split(r"[;&|]+", command):
-            try:
-                tokens = shlex.split(segment)
-            except ValueError:
-                continue
-            if not tokens or Path(tokens[0]).name not in {"pkill", "killall"}:
-                continue
-            if Path(tokens[0]).name == "pkill":
-                targets = [
-                    tokens[index + 1]
-                    for index, token in enumerate(tokens[:-1])
-                    if token in {"-f", "--full"}
-                ]
-                if not targets:
-                    targets = [token for token in tokens[1:] if not token.startswith("-")]
-            else:
-                targets = [token for token in tokens[1:] if not token.startswith("-")]
-            if any(generic.fullmatch(target) for target in targets):
-                raise ToolPolicyError(
-                    "do not pkill/killall a generic Python interpreter; stop the "
-                    "known managed command or target the service module instead"
-                )
+    def _reject_unmanaged_process_termination(command: str) -> None:
+        """Keep shell cleanup from terminating the resident agent/controller.
+
+        A command started through ``start`` has a durable id and must be ended
+        through ``stop``.  Direct signal delivery is not safely attributable:
+        the task, the agent and the controller share one PID namespace.  In
+        particular, scanning ``/proc`` and killing matching Python processes
+        can kill the parent process before it can persist state.
+        """
+        direct_signal = re.compile(
+            r"\b(?:pkill|killall)\b|\bkill\s+(?:-[A-Za-z0-9]+\s+)?(?:['\"]?\$|\d)|"
+            r"\b(?:os|signal)\.kill\s*\("
+        )
+        if direct_signal.search(command):
+            raise ToolPolicyError(
+                "direct process termination is disabled; use stop with the known "
+                "managed command id instead"
+            )
 
     def poll(self, command_id: str) -> ToolResult:
         started = time.monotonic()
