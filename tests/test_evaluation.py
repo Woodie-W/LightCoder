@@ -8,6 +8,7 @@ import pytest
 
 from lightcoder.evaluation import (
     EvaluationError,
+    adopt_evaluator,
     evaluation_summary,
     load_attempts,
     restore_attempt,
@@ -68,6 +69,7 @@ def test_managed_evaluation_versions_compares_and_restores(tmp_path: Path) -> No
     assert first["comparison"]["classification"] == "baseline"
 
     (workspace / "score.txt").write_text("2\n", encoding="utf-8")
+    (workspace / "new-candidate-only.txt").write_text("new\n", encoding="utf-8")
     second = submit_evaluation(workspace, store=store, message="improve")
     assert second["evaluator_hash"] == first["evaluator_hash"]
     assert second["comparison"]["classification"] == "improved"
@@ -88,6 +90,7 @@ def test_managed_evaluation_versions_compares_and_restores(tmp_path: Path) -> No
     restored = restore_attempt(workspace, first["id"], store=store)
     assert restored["commit"] == first["commit"]
     assert (workspace / "score.txt").read_text(encoding="utf-8") == "1\n"
+    assert not (workspace / "new-candidate-only.txt").exists()
     assert "# revised metric" not in evaluator.read_text(encoding="utf-8")
 
 
@@ -189,3 +192,99 @@ print(json.dumps({"metrics": {"partial": int(Path("score.txt").read_text())}}))
     assert attempt["status"] == "completed"
     assert attempt["metrics"]["partial"] == 4
     assert (workspace / ".git").is_dir()
+
+
+def test_snapshot_backend_submits_and_restores_without_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("lightcoder.evaluation.shutil.which", lambda _name: None)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = tmp_path / "store"
+    (workspace / "score.txt").write_text("4\n", encoding="utf-8")
+    evaluator = workspace / ".lightcoder-eval"
+    evaluator.mkdir()
+    (evaluator / "evaluate.py").write_text(
+        "import json\nfrom pathlib import Path\n"
+        "print(json.dumps({'metrics': {'partial': int(Path('score.txt').read_text())}}))\n",
+        encoding="utf-8",
+    )
+    (evaluator / "metrics.toml").write_text(
+        'primary = "partial"\n[metrics.partial]\ndirection = "maximize"\n',
+        encoding="utf-8",
+    )
+
+    first = submit_evaluation(workspace, store=store, message="baseline")
+    assert first["status"] == "completed"
+    assert first["version_backend"] == "snapshot"
+    assert Path(first["snapshot"]).is_dir()
+
+    (workspace / "score.txt").write_text("7\n", encoding="utf-8")
+    (workspace / "later.txt").write_text("later\n", encoding="utf-8")
+    second = submit_evaluation(workspace, store=store, message="second")
+    assert second["comparison"]["classification"] == "improved"
+
+    restore_attempt(workspace, first["id"], store=store)
+    assert (workspace / "score.txt").read_text(encoding="utf-8") == "4\n"
+    assert not (workspace / "later.txt").exists()
+
+
+def test_adopt_plain_metric_evaluator_and_portable_arguments(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    score = workspace / "score.txt"
+    score.write_text("0.248294\n", encoding="utf-8")
+    source = workspace / "evaluate.py"
+    source.write_text(
+        """import sys
+from pathlib import Path
+print(f"S3={float(Path(sys.argv[1]).read_text()):.6f}")
+print("NC: 1.0")
+""",
+        encoding="utf-8",
+    )
+
+    adopted = adopt_evaluator(
+        workspace,
+        source,
+        primary="S3",
+        arguments=[str(score)],
+    )
+    attempt = submit_evaluation(workspace, store=tmp_path / "store")
+
+    assert adopted == workspace / ".lightcoder-eval"
+    assert attempt["status"] == "completed"
+    assert attempt["metrics"]["S3"] == pytest.approx(0.248294)
+    config = (adopted / "metrics.toml").read_text(encoding="utf-8")
+    assert str(workspace) not in config
+    assert '"score.txt"' in config
+
+
+def test_adopt_captures_external_candidate_at_stable_workspace_path(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "evaluate.py"
+    source.write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "print(f'partial={Path(sys.argv[1]).read_text().strip()}')\n",
+        encoding="utf-8",
+    )
+    external = tmp_path / "candidate.align"
+    external.write_text("0.5\n", encoding="utf-8")
+
+    adopted = adopt_evaluator(
+        workspace,
+        source,
+        primary="partial",
+        arguments=[str(external)],
+    )
+    attempt = submit_evaluation(workspace, store=tmp_path / "store")
+
+    captured = workspace / ".lightcoder-eval-inputs" / "arg-00.align"
+    assert captured.read_text(encoding="utf-8") == "0.5\n"
+    assert attempt["metrics"]["partial"] == pytest.approx(0.5)
+    config = (adopted / "metrics.toml").read_text(encoding="utf-8")
+    assert str(external) not in config
+    assert ".lightcoder-eval-inputs/arg-00.align" in config

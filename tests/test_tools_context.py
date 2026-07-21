@@ -93,6 +93,20 @@ def test_managed_job_has_an_independent_timeout_watchdog(
     assert result.exit_code == 124
 
 
+def test_poll_explains_that_silent_running_job_is_not_stalled(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    supervisor = CommandSupervisor(tools)
+    started = supervisor.start("sleep 10", timeout_seconds=10)
+    result = supervisor.poll(started.background_id)
+    assert result.data["status"] == "running"
+    assert result.data["elapsed_seconds"] >= 0
+    assert result.data["log_bytes"] == 0
+    assert "empty log alone is not evidence of a stall" in result.output
+    supervisor.terminate(started.background_id)
+
+
 def test_run_does_not_hang_on_accidental_background_descendant(
     tmp_path: Path, skills_root: Path
 ) -> None:

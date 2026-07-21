@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import shlex
 import tarfile
 import time
@@ -11,6 +13,16 @@ from typing import Any
 
 from .agent import ActionError, CodingAgent
 from .context import ContextManager
+from .evaluation import (
+    EvaluationError,
+    adopt_evaluator,
+    evaluation_store,
+    format_attempt,
+    format_log,
+    load_attempts,
+    restore_attempt,
+    submit_evaluation,
+)
 from .model import ModelClient, ModelError, PermanentModelError
 from .models import (
     Checkpoint,
@@ -32,7 +44,7 @@ PROFILE_ACTIONS = """Return profile_task: call the profile_task tool with an obs
 
 PLAN_ACTIONS = """Return set_plan: call the set_plan tool with a small dependency DAG. Every mandatory item needs an executable verification command; prefer vertical, scoreable milestones over file-by-file decomposition."""
 
-WORK_ACTIONS = """Use the provided tools to complete the active work item. Use run only for bounded foreground commands (default 300 seconds, maximum 1200); use start, poll, logs, and stop for services and long jobs. Read before uncertain edits and run a focused check after mutations. Once the acceptance criteria are satisfied, call begin_verification, then accept_work_item with current evidence."""
+WORK_ACTIONS = """Use the provided tools to complete the active work item. Use run for foreground commands and start, poll, logs, and stop for observable services or long jobs; both remain bounded by the task wall time. Read before uncertain edits and run a focused check after mutations. Once the acceptance criteria are satisfied, call begin_verification, then accept_work_item with current evidence."""
 
 LONG_HORIZON_ACTIONS = """Use the provided tools to make measured progress toward a scoreable artifact. Keep decomposition advisory, preserve the best valid artifact, and use checkpoints after verified improvements. Long work must use start/poll/logs/stop; run is only for bounded foreground checks. Call begin_final_verification only after relevant checks succeed."""
 
@@ -64,7 +76,12 @@ def _tool_schema(
     }
 
 
-def native_tool_schemas(phase: str) -> list[dict[str, Any]]:
+def native_tool_schemas(
+    phase: str,
+    *,
+    managed_evaluation: bool = False,
+    managed_evaluation_decision: bool = False,
+) -> list[dict[str, Any]]:
     """Native Chat Completions tools exposed for one controller phase.
 
     The tool names deliberately match the durable controller actions.  This keeps
@@ -77,22 +94,56 @@ def native_tool_schemas(phase: str) -> list[dict[str, Any]]:
     boolean = {"type": "boolean"}
     object_value = {"type": "object", "additionalProperties": True}
     array = {"type": "array", "items": object_value}
+    string_array = {"type": "array", "items": text}
+    managed_evaluation_tool = _tool_schema(
+        "managed_eval",
+        "Manage reproducible numeric evaluations with operation=submit, history, or restore. For submit, after a working evaluator produces a score that will guide repeated iterations, provide its script, primary metric, and arguments. Pass script and arguments again when evaluating a different candidate path; external candidate files are captured into the versioned workspace. Later submits may omit them only when configured paths are unchanged. history lists attempts; restore requires attempt_id and refuses to overwrite dirty work. The official benchmark grader remains authoritative.",
+        {
+            "operation": {
+                "type": "string",
+                "enum": ["submit", "history", "restore"],
+            },
+            "script": text,
+            "primary": text,
+            "direction": {
+                "type": "string",
+                "enum": ["maximize", "minimize"],
+            },
+            "arguments": string_array,
+            "timeout_seconds": number,
+            "message": text,
+            "attempt_id": text,
+        },
+    )
+    skip_managed_evaluation_tool = _tool_schema(
+        "skip_managed_eval",
+        "Skip managed evaluation for only the current Candidate when its score is not comparable or the artifact is not reproducible. A low score is useful as a baseline and is not by itself a reason to skip.",
+        {"reason": text},
+        ["reason"],
+    )
+    if managed_evaluation_decision and phase in {
+        "standard_work",
+        "long_horizon_work",
+        "final_verify",
+    }:
+        return [managed_evaluation_tool, skip_managed_evaluation_tool]
+
     common_tools = [
         _tool_schema(
             "run",
-            "Run a bounded foreground shell command. Default 300 seconds; maximum 1200 seconds. Never use this for a service, watch mode, or long experiment.",
+            "Run a foreground shell command, bounded only by an explicit timeout_seconds or the task's remaining wall time. Use start for a service or a computation that should remain observable while you do other work.",
             {"command": text, "cwd": text, "timeout_seconds": number, "rationale": text},
             ["command"],
         ),
         _tool_schema(
             "start",
-            "Start a managed long-running job or service. It is independently stopped at the task's remaining wall-time (or an earlier timeout_seconds); inspect it with poll or logs and terminate it with stop.",
+            "Start a managed long-running job or service. It is independently stopped at the task's remaining wall-time (or an earlier timeout_seconds). Inspect it with poll or logs. Do not stop a live computation solely because it has not printed output; use elapsed status and independent evidence of a stall.",
             {"command": text, "cwd": text, "timeout_seconds": number, "rationale": text},
             ["command"],
         ),
         _tool_schema(
             "poll",
-            "Return current managed-job status without reading its full output.",
+            "Return managed-job status, elapsed time, log size, and compact output. A running job with an empty log is not by itself stalled.",
             {"command_id": text},
             ["command_id"],
         ),
@@ -133,6 +184,8 @@ def native_tool_schemas(phase: str) -> list[dict[str, Any]]:
             ["reason"],
         ),
     ]
+    if managed_evaluation:
+        common_tools.append(managed_evaluation_tool)
     if phase == "recon":
         return [
             _tool_schema(
@@ -263,6 +316,9 @@ class RunController:
                 "enabled": True,
                 "store": str(root / "runs" / state.run_id / "evaluations"),
                 "local_check_hint_shown": False,
+                "successful_evaluator_runs": 0,
+                "decision_pending": False,
+                "declined": False,
             }
         store = StateStore.create(root, state)
         return cls(
@@ -299,7 +355,12 @@ class RunController:
             return self._commit(state)
         if self._retry_delay(state) > 0:
             return state
-        if state.status in {"new", "waiting"}:
+        if state.status == "waiting":
+            if self._refresh_waiting_jobs(state):
+                return self._commit(state)
+            state.status = "running"
+            self.store.append_event("run_resumed", {"reason": "managed_jobs_finished"})
+        if state.status == "new":
             state.status = "running"
             if not state.episodes:
                 state.episodes.append(
@@ -311,7 +372,7 @@ class RunController:
                     )
                 )
             self.store.append_event(
-                "run_started" if state.revision == 0 else "run_resumed"
+                "run_started"
             )
 
         if state.phase == "recon":
@@ -342,8 +403,8 @@ class RunController:
             state = self.store.load()
             if state.status != "waiting":
                 raise ControllerError(f"run is not waiting: {state.status}")
-            state.status = "running"
             if note:
+                state.status = "running"
                 self.store.append_event("external_input", {"note": note})
                 self.store.append_transcript("user", note, kind="external_input")
             return self._commit(state)
@@ -426,13 +487,23 @@ class RunController:
         remaining_actions: list[dict[str, Any]] = []
         try:
             state.counters["model_calls"] = state.counters.get("model_calls", 0) + 1
+            managed_config = state.runtime_config.get("managed_evaluation", {})
+            managed_enabled = bool(
+                isinstance(managed_config, dict) and managed_config.get("enabled")
+            )
             decision = self.agent.decide(
                 state,
                 contract,
                 core_skill=core_skill,
                 playbook=playbook,
                 timeout_seconds=self._model_request_timeout(state),
-                tools=native_tool_schemas(state.phase),
+                tools=native_tool_schemas(
+                    state.phase,
+                    managed_evaluation=managed_enabled,
+                    managed_evaluation_decision=bool(
+                        managed_enabled and managed_config.get("decision_pending")
+                    ),
+                ),
             )
             state.counters["consecutive_model_errors"] = 0
             state.retry_at = ""
@@ -458,6 +529,7 @@ class RunController:
                     "final_delivery",
                     "wait",
                     "rotate_context",
+                    "skip_managed_eval",
                 } and (index or remaining_actions):
                     raise ActionError(
                         "controller-transition tools must be the only call in a response"
@@ -478,6 +550,7 @@ class RunController:
                         "poll",
                         "terminate",
                         "stop",
+                        "managed_eval",
                     }
                 ):
                     self._record_control_tool_result(state, action)
@@ -540,6 +613,16 @@ class RunController:
         self.store.append_event(
             "agent_action", {"action": name, "rationale": action.get("rationale", "")}
         )
+        managed_config = state.runtime_config.get("managed_evaluation", {})
+        if (
+            isinstance(managed_config, dict)
+            and managed_config.get("decision_pending")
+            and name not in {"managed_eval", "skip_managed_eval"}
+        ):
+            raise ActionError(
+                "a managed evaluation decision is pending; only managed_eval or "
+                "skip_managed_eval is allowed for this turn"
+            )
         if name == "profile_task" and state.phase == "recon":
             state.profile = TaskProfile.from_dict(
                 self._normalize_profile(self._mapping(action, "profile"))
@@ -585,6 +668,7 @@ class RunController:
             "poll",
             "terminate",
             "stop",
+            "managed_eval",
         }:
             if state.phase not in {
                 "standard_work",
@@ -593,6 +677,28 @@ class RunController:
             }:
                 raise ValueError(f"tool action not allowed in {state.phase}")
             self._execute_tool(state, action)
+            return
+        if name == "skip_managed_eval" and state.phase in {
+            "standard_work",
+            "long_horizon_work",
+            "final_verify",
+        }:
+            config = state.runtime_config.get("managed_evaluation", {})
+            if not isinstance(config, dict) or not config.get("decision_pending"):
+                raise ValueError("no managed evaluation decision is pending")
+            reason = str(action.get("reason", "")).strip()
+            if not reason:
+                raise ValueError("skip_managed_eval requires a reason")
+            config["decision_pending"] = False
+            fingerprint = str(config.pop("pending_candidate_fingerprint", ""))
+            if fingerprint:
+                config["last_skipped_candidate_fingerprint"] = fingerprint
+            config.pop("pending_candidate_artifacts", None)
+            config.pop("pending_evaluator_command", None)
+            config.pop("pending_evaluator_cwd", None)
+            self.store.append_event(
+                "managed_evaluation_skipped", {"reason": reason}
+            )
             return
         if name == "batch" and state.phase in {
             "standard_work",
@@ -755,7 +861,9 @@ class RunController:
             raise ValueError("deadline reached before tool execution")
         if name in {"write", "edit"}:
             self._require_mutation_feedback(state, str(action.get("path", "")))
-        if name in {"bash", "run"}:
+        if name == "managed_eval":
+            result = self._execute_managed_evaluation(state, action)
+        elif name in {"bash", "run"}:
             # `bash` plus background is accepted only for old trajectories.
             # New prompts expose the unambiguous `start` action instead.
             if name == "bash" and bool(action.get("background", False)):
@@ -775,13 +883,18 @@ class RunController:
                     "run appears to start a persistent process; use start, then poll/logs/stop"
                 )
             requested_timeout = action.get("timeout_seconds")
-            timeout_seconds = float(requested_timeout) if requested_timeout is not None else 300.0
-            timeout_seconds = min(
-                CommandSupervisor.MAX_RUN_TIMEOUT_SECONDS,
-                max(1.0, timeout_seconds),
+            timeout_seconds = (
+                max(1.0, float(requested_timeout))
+                if requested_timeout is not None
+                else None
             )
             if remaining is not None:
-                timeout_seconds = min(timeout_seconds, max(1.0, remaining))
+                task_bound = max(1.0, remaining)
+                timeout_seconds = (
+                    min(timeout_seconds, task_bound)
+                    if timeout_seconds is not None
+                    else task_bound
+                )
             result = self.commands.run(
                 command,
                 cwd=str(action.get("cwd", ".")),
@@ -824,6 +937,198 @@ class RunController:
         else:
             result = self.commands.terminate(str(action.get("command_id", "")))
         self._record_tool_result(state, action, result)
+        if name == "poll" and result.data.get("status") == "running":
+            waiting_ids = [
+                str(item["id"])
+                for item in self.commands.recover()
+                if item.get("status") == "running"
+            ]
+            if result.background_id and result.background_id not in waiting_ids:
+                waiting_ids.append(result.background_id)
+            state.runtime_config["waiting_command_ids"] = waiting_ids
+            state.status = "waiting"
+            self.store.append_event(
+                "run_waiting",
+                {
+                    "reason": "managed_job_running",
+                    "command_id": result.background_id,
+                    "elapsed_seconds": result.data.get("elapsed_seconds", 0),
+                },
+            )
+
+    def _refresh_waiting_jobs(self, state: RunState) -> bool:
+        """Poll live jobs without spending a model call while the run is waiting."""
+        configured = state.runtime_config.get("waiting_command_ids", [])
+        command_ids = (
+            [str(value) for value in configured]
+            if isinstance(configured, list) and configured
+            else [
+                str(item["id"])
+                for item in self.commands.recover()
+                if item.get("status") == "running"
+            ]
+        )
+        if not command_ids:
+            return False
+        still_running: list[str] = []
+        for command_id in command_ids:
+            result = self.commands.poll(command_id)
+            self._record_tool_result(
+                state,
+                {
+                    "action": "poll",
+                    "command_id": command_id,
+                    "rationale": "controller-managed waiting poll",
+                },
+                result,
+            )
+            if result.data.get("status") == "running":
+                still_running.append(command_id)
+        if still_running:
+            state.runtime_config["waiting_command_ids"] = still_running
+        else:
+            state.runtime_config.pop("waiting_command_ids", None)
+        if still_running:
+            state.status = "waiting"
+            self.store.append_event(
+                "run_waiting",
+                {
+                    "reason": "managed_jobs_running",
+                    "command_ids": still_running,
+                },
+            )
+            return True
+        return False
+
+    def _execute_managed_evaluation(
+        self, state: RunState, action: dict[str, Any]
+    ) -> ToolResult:
+        started = time.monotonic()
+        call_id = new_id("managed-eval")
+        config = state.runtime_config.get("managed_evaluation", {})
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return ToolResult(
+                "managed_eval",
+                call_id,
+                False,
+                time.monotonic() - started,
+                output="managed evaluation is not enabled for this run",
+            )
+        try:
+            operation = str(action.get("operation", "submit")).strip() or "submit"
+            if operation not in {"submit", "history", "restore"}:
+                raise EvaluationError(f"unknown managed evaluation operation: {operation}")
+            if config.get("decision_pending") and operation != "submit":
+                raise EvaluationError(
+                    "a repeated evaluation decision is pending; submit it or use "
+                    "skip_managed_eval before browsing or restoring history"
+                )
+            store = Path(str(config["store"]))
+            if operation == "history":
+                attempts = load_attempts(evaluation_store(self.tools.workspace, store))
+                return ToolResult(
+                    "managed_eval",
+                    call_id,
+                    True,
+                    time.monotonic() - started,
+                    output=format_log(attempts),
+                    exit_code=0,
+                    data={"operation": operation, "attempts": len(attempts)},
+                )
+            if operation == "restore":
+                attempt_id = str(action.get("attempt_id", "")).strip()
+                if not attempt_id:
+                    raise EvaluationError("attempt_id is required for restore")
+                restored = restore_attempt(
+                    self.tools.workspace,
+                    attempt_id,
+                    store=store,
+                    excluded_paths=[self.store.root],
+                )
+                return ToolResult(
+                    "managed_eval",
+                    call_id,
+                    True,
+                    time.monotonic() - started,
+                    output=(
+                        f"restored {restored['id']} at commit {restored['solution']} "
+                        f"({restored['evaluator']})"
+                    ),
+                    affected_paths=["."],
+                    exit_code=0,
+                    data={"operation": operation, "attempt": restored},
+                )
+            script = str(action.get("script", "")).strip()
+            if script:
+                primary = str(action.get("primary", "")).strip()
+                if not primary:
+                    raise EvaluationError(
+                        "primary is required when adopting an evaluator script"
+                    )
+                raw_arguments = action.get("arguments", [])
+                if not isinstance(raw_arguments, list) or not all(
+                    isinstance(item, str) for item in raw_arguments
+                ):
+                    raise EvaluationError("arguments must be a list of strings")
+                adopt_evaluator(
+                    self.tools.workspace,
+                    Path(script),
+                    primary=primary,
+                    direction=str(action.get("direction", "maximize")),
+                    arguments=raw_arguments,
+                    timeout_seconds=float(action.get("timeout_seconds", 600)),
+                )
+            record = submit_evaluation(
+                self.tools.workspace,
+                store=store,
+                message=str(action.get("message", "")),
+                state_root=self.store.root,
+                run_id=state.run_id,
+                model=self.agent.model.model,
+            )
+            success = record.get("status") == "completed"
+            if success:
+                config["decision_pending"] = False
+                config["local_check_hint_shown"] = True
+                config["successful_evaluator_runs"] = 0
+                pending_command = str(config.pop("pending_evaluator_command", ""))
+                pending_cwd = str(config.pop("pending_evaluator_cwd", "."))
+                if script:
+                    pending_command = shlex.join([script, *raw_arguments])
+                    pending_cwd = "."
+                config["last_managed_observation_fingerprint"] = (
+                    self._evaluation_observation_fingerprint(
+                        pending_command, pending_cwd
+                    )
+                )
+            self.store.append_event(
+                "managed_evaluation_submitted",
+                {
+                    "attempt_id": record.get("id"),
+                    "status": record.get("status"),
+                    "metrics": record.get("metrics", {}),
+                    "comparison": record.get("comparison", {}),
+                },
+            )
+            return ToolResult(
+                "managed_eval",
+                call_id,
+                success,
+                time.monotonic() - started,
+                output=format_attempt(record),
+                exit_code=0 if success else int(record.get("return_code") or 1),
+                affected_paths=[".lightcoder-eval"],
+                data={"attempt": record},
+            )
+        except (EvaluationError, OSError, ValueError) as error:
+            return ToolResult(
+                "managed_eval",
+                call_id,
+                False,
+                time.monotonic() - started,
+                output=str(error),
+                exit_code=1,
+            )
 
     def _record_tool_result(
         self, state: RunState, action: dict[str, Any], result: ToolResult
@@ -907,13 +1212,84 @@ class RunController:
         if (
             not isinstance(config, dict)
             or not config.get("enabled")
-            or config.get("local_check_hint_shown")
-            or str(action.get("action", "")) not in {"bash", "run"}
+            or config.get("decision_pending")
         ):
             return
-        command = str(action.get("command", "")).lower()
+        action_name = str(action.get("action", ""))
+        raw_command = str(action.get("command", ""))
+        command_cwd = str(action.get("cwd", "."))
+        completed_background_id = ""
+        if action_name == "poll" and result.data.get("status") == "exited":
+            completed_background_id = str(
+                result.background_id or action.get("command_id", "")
+            )
+            try:
+                metadata = self.commands.describe(completed_background_id)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                metadata = {}
+            raw_command = str(metadata.get("command", ""))
+            command_cwd = str(metadata.get("cwd", "."))
+        command = raw_command.lower()
         if "lightcoder eval" in command:
             return
+        path = Path(str(action.get("path", ""))).name.lower()
+        rationale = str(action.get("rationale", "")).lower()
+        evaluator_intent_markers = (
+            "evaluator",
+            "grader",
+            "metric calculator",
+            "metrics calculator",
+            "score calculator",
+            "scoring script",
+        )
+        writes_evaluator = (
+            action_name in {"write", "edit"}
+            and (
+                self._looks_like_evaluator_script(path)
+                or (
+                    not config.get("candidate_evaluator_path")
+                    and Path(path).suffix == ".py"
+                    and any(marker in rationale for marker in evaluator_intent_markers)
+                )
+            )
+        )
+        if writes_evaluator:
+            config["candidate_evaluator_path"] = str(action.get("path", ""))
+            self.store.append_event(
+                "managed_evaluator_detected",
+                {"path": str(action.get("path", "")), "success": result.success},
+            )
+            return
+        try:
+            command_tokens = shlex.split(raw_command)
+            command_names = {
+                Path(token.rstrip(";,|&")).name.lower()
+                for token in command_tokens
+            }
+        except ValueError:
+            command_tokens = []
+            command_names = set()
+        candidate_name = Path(
+            str(config.get("candidate_evaluator_path", ""))
+        ).name.lower()
+        candidate_stem = Path(candidate_name).stem
+        imports_candidate = bool(candidate_stem) and any(
+            marker in command
+            for marker in (
+                f"import {candidate_stem}",
+                f"from {candidate_stem} import",
+            )
+        )
+        runs_evaluator = (
+            action_name in {"bash", "run", "start"} or bool(completed_background_id)
+        ) and (
+            imports_candidate
+            or any(
+                self._looks_like_evaluator_script(name)
+                or (candidate_name and name == candidate_name)
+                for name in command_names
+            )
+        )
         test_markers = (
             "pytest",
             "cargo test",
@@ -926,20 +1302,333 @@ class RunController:
             "test.sh",
             "benchmark",
         )
-        if not any(marker in command for marker in test_markers):
+        runs_local_check = action_name in {"bash", "run", "start"} and any(
+            marker in command for marker in test_markers
+        )
+        reports_metric = (
+            (
+                action_name in {"bash", "run", "start"}
+                and any(
+                    marker in rationale
+                    for marker in (
+                        "test",
+                        "evaluate",
+                        "evaluation",
+                        "benchmark",
+                        "baseline",
+                        "measure",
+                        "score",
+                    )
+                )
+                # A completed managed job has lost the original model action's
+                # rationale across resume. Its durable output and Candidate
+                # artifact provide the stronger signal used below.
+                or bool(completed_background_id)
+            )
+            and result.success
+            and self._looks_like_metric_output(result.output)
+        )
+        candidate_artifacts = self._reported_candidate_paths(
+            result.output, command_cwd
+        )
+        candidate_fingerprint = self._evaluation_observation_fingerprint(
+            " ".join(candidate_artifacts), command_cwd
+        )
+        candidate_metric = (
+            reports_metric
+            and bool(candidate_name)
+            and int(config.get("successful_evaluator_runs", 0)) >= 1
+            and bool(candidate_artifacts)
+            and candidate_fingerprint
+            != config.get("last_skipped_candidate_fingerprint")
+        )
+        if not (runs_evaluator or runs_local_check or reports_metric):
+            return
+        if runs_evaluator:
+            if (
+                not result.success
+                or result.exit_code not in {0, None}
+                or not self._looks_like_metric_output(result.output)
+            ):
+                return
+            observation_fingerprint = self._evaluation_observation_fingerprint(
+                raw_command, command_cwd
+            )
+            if observation_fingerprint == config.get(
+                "last_managed_observation_fingerprint"
+            ) or observation_fingerprint == config.get(
+                "last_skipped_candidate_fingerprint"
+            ):
+                self.store.append_event(
+                    "managed_evaluator_repeat_ignored",
+                    {"command": raw_command, "reason": "candidate_unchanged"},
+                )
+                return
+            observed_jobs = list(config.get("observed_evaluator_command_ids", []))
+            if completed_background_id:
+                if completed_background_id in observed_jobs:
+                    return
+                observed_jobs.append(completed_background_id)
+                config["observed_evaluator_command_ids"] = observed_jobs[-100:]
+            successful_runs = int(config.get("successful_evaluator_runs", 0)) + 1
+            config["successful_evaluator_runs"] = successful_runs
+            self.store.append_event(
+                "managed_evaluator_score_observed",
+                {
+                    "successful_runs": successful_runs,
+                    "command": raw_command,
+                    "metrics": self._metric_names(result.output),
+                },
+            )
+            # A first score is often a smoke test or supplied reference.  Repeated
+            # use is the stronger, task-agnostic signal that versioned comparison
+            # can help without forcing the mechanism onto one-off checks.
+            if successful_runs < 2:
+                return
+            config["decision_pending"] = True
+            config["pending_evaluator_command"] = raw_command
+            config["pending_evaluator_cwd"] = command_cwd
+        elif candidate_metric:
+            # A reusable evaluator has already passed its smoke/reference run,
+            # and a later solver command is now producing a scored Candidate.
+            # Require one explicit adoption decision before the solver silently
+            # continues optimizing only against its own inline score.
+            config["decision_pending"] = True
+            config.pop("pending_evaluator_command", None)
+            config.pop("pending_evaluator_cwd", None)
+            config["pending_candidate_artifacts"] = candidate_artifacts
+            config["pending_candidate_fingerprint"] = candidate_fingerprint
+        elif (
+            reports_metric
+            and bool(candidate_name)
+            and int(config.get("successful_evaluator_runs", 0)) >= 1
+        ):
+            # Inline diagnostics without a durable Candidate are useful during
+            # implementation, but there is nothing reproducible to submit yet.
+            return
+        elif config.get("local_check_hint_shown"):
             return
         config["local_check_hint_shown"] = True
+        signal = (
+            "evaluator_script"
+            if runs_evaluator
+            else "candidate_metric"
+            if candidate_metric
+            else "local_metric"
+            if reports_metric
+            else "local_check"
+        )
+        evaluator_label = next(
+            (
+                name
+                for name in command_names
+                if self._looks_like_evaluator_script(name)
+                or (candidate_name and name == candidate_name)
+            ),
+            candidate_name or "evaluator",
+        )
+        adoption_command = self._evaluator_adoption_command(
+            command_tokens,
+            candidate_name=candidate_name,
+            output=result.output,
+        )
         self.store.append_transcript(
             "user",
-            "This was recorded as a local check. If managed comparison is useful, "
-            "you may create `.lightcoder-eval/evaluate.py` and `metrics.toml`, then "
-            "run `lightcoder eval`. It is optional.",
+            f"Your reusable evaluator `{evaluator_label}` just ran successfully. "
+            "This is now a repeated numeric evaluation. Before continuing, use the "
+            "native `managed_eval` tool with this script, primary metric, and the "
+            "same arguments, or call `skip_managed_eval` with a reason if these runs "
+            "are genuinely not comparable. "
+            f"The equivalent human CLI is `{adoption_command}`. The official grader "
+            "remains authoritative."
+            if signal == "evaluator_script"
+            else f"Your Candidate-producing command reported numeric metrics after "
+            f"the reusable evaluator `{candidate_name}` had already passed a "
+            "reference/smoke run. Before continuing optimization, use the native "
+            "`managed_eval` tool with that evaluator, its primary metric, and the "
+            f"new Candidate arguments {candidate_artifacts}; or "
+            "call `skip_managed_eval` with a reason if the score is not comparable. "
+            "A low score is still a useful baseline; skip only when this Candidate "
+            "cannot be reproduced or compared. "
+            "The managed evaluator will independently verify and version the "
+            "Candidate. The official grader remains authoritative."
+            if signal == "candidate_metric"
+            else "Your successful local run reported a numeric metric. If this "
+            "score will guide later iterations, keep the scoring path reusable in "
+            "`.lightcoder-eval/evaluate.py`, define it in "
+            "`.lightcoder-eval/metrics.toml`, and run `lightcoder eval -m "
+            '"baseline"` before the next candidate. This is optional; skip it for '
+            "a one-off measurement."
+            if signal == "local_metric"
+            else "This was a local check. If repeated metric comparison would help, "
+            "you may create `.lightcoder-eval/evaluate.py` and "
+            "`.lightcoder-eval/metrics.toml`, then run `lightcoder eval`. It is "
+            "optional; ordinary tests remain valid.",
             kind="controller_feedback",
         )
         self.store.append_event(
             "managed_evaluation_hint_shown",
-            {"command": str(action.get("command", "")), "success": result.success},
+            {
+                "signal": signal,
+                "command": str(action.get("command", "")),
+                "path": str(action.get("path", "")),
+                "success": result.success,
+                "candidate_artifacts": candidate_artifacts,
+            },
         )
+
+    @classmethod
+    def _evaluator_adoption_command(
+        cls,
+        command_tokens: list[str],
+        *,
+        candidate_name: str,
+        output: str,
+    ) -> str:
+        script_index = next(
+            (
+                index
+                for index, token in enumerate(command_tokens)
+                if cls._looks_like_evaluator_script(Path(token).name)
+                or (
+                    candidate_name
+                    and Path(token).name.lower() == candidate_name
+                )
+            ),
+            None,
+        )
+        primary = next(iter(cls._metric_names(output)), "partial")
+        if script_index is None:
+            source = candidate_name or "evaluate.py"
+            return (
+                f"lightcoder eval --adopt {shlex.quote(source)} "
+                f"--primary {shlex.quote(primary)} -- <evaluator arguments>"
+            )
+        source = command_tokens[script_index]
+        arguments = command_tokens[script_index + 1 :]
+        value = (
+            f"lightcoder eval --adopt {shlex.quote(source)} "
+            f"--primary {shlex.quote(primary)}"
+        )
+        if arguments:
+            value += f" -- {shlex.join(arguments)}"
+        return value
+
+    @staticmethod
+    def _looks_like_evaluator_script(name: str) -> bool:
+        path = Path(name)
+        if path.suffix.lower() != ".py":
+            return False
+        stem = path.stem.lower()
+        roots = (
+            "eval",
+            "evaluate",
+            "evaluator",
+            "evaluation",
+            "score",
+            "scoring",
+            "grader",
+            "grading",
+            "metric",
+            "metrics",
+            "benchmark",
+        )
+        return stem in roots or stem.startswith(
+            tuple(f"{root}_" for root in roots)
+        ) or stem.endswith(tuple(f"_{root}" for root in roots))
+
+    @staticmethod
+    def _looks_like_metric_output(output: str) -> bool:
+        return bool(RunController._metric_names(output))
+
+    @staticmethod
+    def _metric_names(output: str) -> list[str]:
+        names = re.findall(
+            r"(?i)(?<![\w./-])(?:(?:best|final|current|baseline|initial)\s+)?"
+            r"([a-z][a-z0-9_-]{0,31})\s*[:=]\s*"
+            r"-?(?:\d+(?:\.\d*)?|\.\d+)\s*%?",
+            output,
+        )
+        return list(dict.fromkeys(names))
+
+    def _reported_candidate_paths(self, output: str, cwd: str) -> list[str]:
+        """Return durable files explicitly reported as produced Candidates."""
+        try:
+            base = Path(cwd)
+            if not base.is_absolute():
+                base = self.tools.resolve_path(cwd)
+        except (OSError, ValueError):
+            base = self.tools.workspace
+        paths: list[str] = []
+        for line in output.splitlines():
+            lowered = line.lower()
+            if not any(
+                marker in lowered
+                for marker in (
+                    "writing",
+                    "written",
+                    "wrote",
+                    "saved",
+                    "generated",
+                    "created",
+                    "exported",
+                    "candidate",
+                    "output",
+                )
+            ):
+                continue
+            for token in re.findall(r"(?<!\w)(?:/|\.\.?/)[^\s,;]+", line):
+                candidate = Path(token.rstrip(".:'\") ]"))
+                if not candidate.is_absolute():
+                    candidate = base / candidate
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                if resolved.is_file():
+                    value = str(resolved)
+                    if value not in paths:
+                        paths.append(value)
+        return paths
+
+    def _evaluation_observation_fingerprint(self, command: str, cwd: str) -> str:
+        """Identify the evaluated candidate without inspecting task semantics."""
+        hasher = hashlib.sha256()
+        hasher.update(self.tools.workspace_revision().encode())
+        hasher.update(b"\0")
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = []
+        try:
+            base = Path(cwd)
+            if not base.is_absolute():
+                base = self.tools.resolve_path(cwd)
+        except (OSError, ValueError):
+            base = self.tools.workspace
+        for token in tokens:
+            candidate = Path(token.rstrip(";,|&"))
+            if not candidate.is_absolute():
+                candidate = base / candidate
+            resolved = candidate
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(self.tools.workspace)
+                continue
+            except (OSError, ValueError):
+                pass
+            if not resolved.is_file():
+                continue
+            hasher.update(str(resolved).encode())
+            hasher.update(b"\0")
+            try:
+                with resolved.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        hasher.update(chunk)
+            except OSError:
+                stat = resolved.stat()
+                hasher.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+        return hasher.hexdigest()
 
     def _managed_job_timeout(
         self, state: RunState, action: dict[str, Any]
@@ -1018,7 +1707,15 @@ class RunController:
     def _tool_evidence(
         self, state: RunState, result: ToolResult, action: dict[str, Any]
     ) -> Evidence:
-        if result.tool in {"bash", "run", "start", "poll", "stop", "terminate"}:
+        if result.tool in {
+            "bash",
+            "run",
+            "start",
+            "poll",
+            "stop",
+            "terminate",
+            "managed_eval",
+        }:
             kind = "command"
         elif result.tool in {"read", "read_command_output", "logs"}:
             kind = "observation"

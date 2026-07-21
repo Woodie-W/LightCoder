@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
-from lightcoder.controller import RunController
+from lightcoder.controller import RunController, native_tool_schemas
+from lightcoder.evaluation import load_attempts
 from lightcoder.model import ModelError, ModelResponse, PermanentModelError
 from lightcoder.models import TaskProfile, WorkItem
 from lightcoder.reporting import build_run_report
+from lightcoder.tools import ToolResult
 
 from conftest import CompletingModel, ScriptedModel
 
@@ -75,7 +79,7 @@ def test_managed_evaluation_is_optional_and_reminds_after_first_local_test(
     config = state.runtime_config["managed_evaluation"]
     assert config["local_check_hint_shown"] is True
     transcript = controller.store.transcript_path.read_text(encoding="utf-8")
-    assert "recorded as a local check" in transcript
+    assert "This was a local check" in transcript
 
     plain_workspace = tmp_path / "plain-workspace"
     plain_workspace.mkdir()
@@ -91,6 +95,662 @@ def test_managed_evaluation_is_optional_and_reminds_after_first_local_test(
         plain_state, "Use tools", core_skill="profile-task"
     )
     assert "OPTIONAL MANAGED EVALUATION" not in plain_messages[0].content
+
+
+def test_managed_evaluation_native_tool_adopts_and_records_baseline(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    (workspace / "eval_align.py").write_text(
+        "print('S3 = 0.248294')\n", encoding="utf-8"
+    )
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+
+    enabled_names = {
+        item["function"]["name"]
+        for item in native_tool_schemas(
+            "long_horizon_work", managed_evaluation=True
+        )
+    }
+    plain_names = {
+        item["function"]["name"]
+        for item in native_tool_schemas("long_horizon_work")
+    }
+    assert "managed_eval" in enabled_names
+    assert "managed_eval" not in plain_names
+    decision_names = {
+        item["function"]["name"]
+        for item in native_tool_schemas(
+            "long_horizon_work",
+            managed_evaluation=True,
+            managed_evaluation_decision=True,
+        )
+    }
+    assert decision_names == {"managed_eval", "skip_managed_eval"}
+
+    result = controller._execute_managed_evaluation(
+        state,
+        {
+            "action": "managed_eval",
+            "script": "eval_align.py",
+            "primary": "S3",
+            "message": "baseline",
+        },
+    )
+
+    assert result.success
+    assert "S3=0.248294" in result.output
+    assert state.runtime_config["managed_evaluation"]["successful_evaluator_runs"] == 0
+    store = Path(state.runtime_config["managed_evaluation"]["store"])
+    assert load_attempts(store)[0]["metrics"]["S3"] == pytest.approx(0.248294)
+    assert build_run_report(controller.store)["managed_evaluation"]["attempts"] == 1
+
+
+def test_managed_evaluation_history_restore_and_embedded_state_isolation(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    (workspace / "score.txt").write_text("1\n", encoding="utf-8")
+    (workspace / "evaluate.py").write_text(
+        "from pathlib import Path\n"
+        "print(f'S3={Path(\"score.txt\").read_text().strip()}')\n",
+        encoding="utf-8",
+    )
+    state_root = workspace / "runtime-state"
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=state_root,
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+
+    controller._execute_tool(
+        state,
+        {
+            "action": "managed_eval",
+            "operation": "submit",
+            "script": "evaluate.py",
+            "primary": "S3",
+            "message": "one",
+        },
+    )
+    first_evidence = controller.store.evidence_by_id([state.evidence_ids[-1]])[0]
+    assert first_evidence.workspace_revision == controller.tools.workspace_revision()
+    tracked = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "runtime-state/" not in tracked
+
+    (workspace / "score.txt").write_text("2\n", encoding="utf-8")
+    second = controller._execute_managed_evaluation(
+        state,
+        {"action": "managed_eval", "operation": "submit", "message": "two"},
+    )
+    assert "S3=2.0" in second.output
+    history = controller._execute_managed_evaluation(
+        state, {"action": "managed_eval", "operation": "history"}
+    )
+    assert history.success
+    assert "A0001" in history.output and "A0002" in history.output
+    restored = controller._execute_managed_evaluation(
+        state,
+        {
+            "action": "managed_eval",
+            "operation": "restore",
+            "attempt_id": "A0001",
+        },
+    )
+    assert restored.success
+    assert (workspace / "score.txt").read_text(encoding="utf-8") == "1\n"
+
+
+def test_background_evaluator_counts_once_when_poll_observes_completion(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "evaluate.py").write_text(
+        "print('S3=0.2')\n", encoding="utf-8"
+    )
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "evaluate.py",
+            "content": "print('S3=0.2')\n",
+            "rationale": "numeric evaluator",
+        },
+    )
+
+    command_ids: list[str] = []
+    for _ in range(2):
+        before = {item["id"] for item in controller.commands.recover()}
+        controller._execute_tool(
+            state,
+            {"action": "start", "command": "python evaluate.py", "cwd": "."},
+        )
+        created = [
+            item for item in controller.commands.recover() if item["id"] not in before
+        ]
+        assert len(created) == 1
+        command_id = created[0]["id"]
+        command_ids.append(command_id)
+        for _poll in range(50):
+            controller._execute_tool(
+                state, {"action": "poll", "command_id": command_id}
+            )
+            metadata = controller.commands.describe(command_id)
+            if metadata.get("status") == "exited":
+                controller._refresh_waiting_jobs(state)
+                break
+        else:
+            pytest.fail("background evaluator did not finish")
+
+    config = state.runtime_config["managed_evaluation"]
+    assert config["successful_evaluator_runs"] == 2
+    assert config["decision_pending"] is True
+    assert config["observed_evaluator_command_ids"] == command_ids
+
+    controller._execute_tool(
+        state, {"action": "poll", "command_id": command_ids[-1]}
+    )
+    assert config["successful_evaluator_runs"] == 2
+
+
+def test_running_poll_waits_and_controller_refresh_avoids_model_calls(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "wait for computation",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    controller._execute_tool(
+        state,
+        {
+            "action": "start",
+            "command": "sleep 0.2; printf finished",
+            "cwd": ".",
+            "timeout_seconds": 2,
+        },
+    )
+    command_id = controller.commands.recover()[0]["id"]
+    controller._execute_tool(
+        state, {"action": "poll", "command_id": command_id}
+    )
+    assert state.status == "waiting"
+    assert controller._refresh_waiting_jobs(state) is True
+    assert state.status == "waiting"
+    assert state.counters.get("model_calls", 0) == 0
+
+    time.sleep(0.3)
+    assert controller._refresh_waiting_jobs(state) is False
+    assert state.counters.get("model_calls", 0) == 0
+    assert "waiting_command_ids" not in state.runtime_config
+    evidence = controller.store.evidence_by_id([state.evidence_ids[-1]])[0]
+    assert "finished" in evidence.summary
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert "controller-managed waiting poll" not in events
+    assert "managed_jobs_running" in events
+
+
+def test_submitted_candidate_rechecks_do_not_retrigger_until_candidate_changes(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "evaluate.py",
+            "content": "print('S3=0.1')\n",
+            "rationale": "numeric evaluator",
+        },
+    )
+    for _ in range(2):
+        controller._execute_tool(
+            state, {"action": "run", "command": "python evaluate.py", "cwd": "."}
+        )
+    config = state.runtime_config["managed_evaluation"]
+    assert config["decision_pending"] is True
+
+    controller._execute_tool(
+        state,
+        {
+            "action": "managed_eval",
+            "operation": "submit",
+            "script": "evaluate.py",
+            "primary": "S3",
+        },
+    )
+    assert config["decision_pending"] is False
+    assert config["successful_evaluator_runs"] == 0
+
+    for _ in range(2):
+        controller._execute_tool(
+            state, {"action": "run", "command": "python evaluate.py", "cwd": "."}
+        )
+    assert config["successful_evaluator_runs"] == 0
+    assert config["decision_pending"] is False
+
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "evaluate.py",
+            "content": "print('S3=0.2')\n",
+            "rationale": "revise numeric evaluator",
+        },
+    )
+    for _ in range(2):
+        controller._execute_tool(
+            state, {"action": "run", "command": "python evaluate.py", "cwd": "."}
+        )
+    assert config["successful_evaluator_runs"] == 2
+    assert config["decision_pending"] is True
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert "managed_evaluator_repeat_ignored" in events
+
+
+@pytest.mark.parametrize(
+    ("write_action", "run_command"),
+    [
+        (
+            {
+                "action": "write",
+                "path": "eval_align.py",
+                "content": "print('S3=0.1')\n",
+            },
+            "python eval_align.py",
+        ),
+        (
+            {
+                "action": "write",
+                "path": "quality.py",
+                "content": "print('S3=0.1')\n",
+                "rationale": "Create a pure Python metric calculator",
+            },
+            "python quality.py",
+        ),
+    ],
+)
+def test_managed_evaluation_reminds_after_authored_evaluator_runs(
+    tmp_path: Path,
+    skills_root: Path,
+    write_action: dict[str, object],
+    run_command: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+
+    controller._execute_tool(state, write_action)
+    assert not state.runtime_config["managed_evaluation"]["local_check_hint_shown"]
+    controller._execute_tool(
+        state,
+        {"action": "run", "command": run_command, "cwd": "."},
+    )
+    assert not state.runtime_config["managed_evaluation"]["local_check_hint_shown"]
+    controller._execute_tool(
+        state,
+        {"action": "run", "command": run_command, "cwd": "."},
+    )
+
+    assert state.runtime_config["managed_evaluation"]["local_check_hint_shown"]
+    assert state.runtime_config["managed_evaluation"]["decision_pending"]
+    pending_context = controller.context.build_messages(
+        state, "Use tools", core_skill="execute-work-item"
+    )[-1].content
+    assert '"decision_pending": true' in pending_context
+    assert '"unmanaged_numeric_runs": 2' in pending_context
+    transcript = controller.store.transcript_path.read_text(encoding="utf-8")
+    assert "repeated numeric evaluation" in transcript
+    assert "lightcoder eval --adopt" in transcript
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert '"signal": "evaluator_script"' in events
+    assert "managed_evaluator_detected" in events
+
+
+def test_generic_evaluation_utility_is_not_misclassified_as_evaluator(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "graph_utils.py",
+            "content": "def compute_score(): return 0\n",
+            "rationale": "Build graph loading and evaluation utilities",
+        },
+    )
+    assert "candidate_evaluator_path" not in state.runtime_config["managed_evaluation"]
+    assert "managed_evaluator_detected" not in controller.store.events_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_managed_evaluation_reminds_after_solver_reports_metric(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "solver.py").write_text(
+        "print('S3: 0.104172')\n", encoding="utf-8"
+    )
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python solver.py",
+            "cwd": ".",
+            "rationale": "Test greedy alignment baseline",
+        },
+    )
+
+    assert state.runtime_config["managed_evaluation"]["local_check_hint_shown"]
+    transcript = controller.store.transcript_path.read_text(encoding="utf-8")
+    assert "reported a numeric metric" in transcript
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert '"signal": "local_metric"' in events
+
+
+def test_managed_evaluation_gates_candidate_metric_after_reference_run(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "eval.py").write_text(
+        "print('S3=0.18')\nprint('NC=0.31')\n", encoding="utf-8"
+    )
+    (workspace / "solver.py").write_text(
+        "from pathlib import Path\n"
+        "Path('/tmp/candidate.align').write_text('candidate\\n')\n"
+        "print('Final S3: 0.202510, Ea: 7148, E2_aligned: 26382')\n"
+        "print('Writing alignment to /tmp/candidate.align...')\n",
+        encoding="utf-8",
+    )
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "eval.py",
+            "content": "print('S3=0.18')\nprint('NC=0.31')\n",
+            "rationale": "Create evaluation script",
+        },
+    )
+    controller._execute_tool(
+        state, {"action": "run", "command": "python eval.py", "cwd": "."}
+    )
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python -c \"print('S3=0.03, Ea=2, E2a=5')\"",
+            "cwd": ".",
+            "rationale": "Test an in-memory diagnostic",
+        },
+    )
+    assert state.runtime_config["managed_evaluation"]["decision_pending"] is False
+    assert state.runtime_config["managed_evaluation"]["local_check_hint_shown"] is False
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python solver.py",
+            "cwd": ".",
+            "rationale": "Quick test of candidate alignment",
+        },
+    )
+
+    config = state.runtime_config["managed_evaluation"]
+    assert config["decision_pending"] is True
+    assert config["successful_evaluator_runs"] == 1
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert '"signal": "candidate_metric"' in events
+    assert '"candidate_artifacts": ["/tmp/candidate.align"]' in events
+    transcript = controller.store.transcript_path.read_text(encoding="utf-8")
+    assert "Candidate-producing command" in transcript
+
+    with pytest.raises(ValueError, match="only managed_eval or skip_managed_eval"):
+        controller._apply_action(
+            state,
+            {"action": "run", "command": "true", "cwd": "."},
+        )
+    assert config["decision_pending"] is True
+
+    controller._apply_action(
+        state,
+        {
+            "action": "skip_managed_eval",
+            "reason": "this Candidate is not reproducible",
+        },
+    )
+    assert config["decision_pending"] is False
+    assert config["declined"] is False
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python solver.py",
+            "cwd": ".",
+            "rationale": "Quick test of candidate alignment",
+        },
+    )
+    assert config["decision_pending"] is False
+
+    (workspace / "solver.py").write_text(
+        (workspace / "solver.py").read_text(encoding="utf-8").replace(
+            "candidate\\n", "changed candidate\\n"
+        ),
+        encoding="utf-8",
+    )
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python solver.py",
+            "cwd": ".",
+            "rationale": "Quick test of changed candidate alignment",
+        },
+    )
+    assert config["decision_pending"] is True
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert '"kind": "managed_evaluation_skipped"' in events
+
+    result = controller._execute_managed_evaluation(
+        state,
+        {
+            "action": "managed_eval",
+            "operation": "submit",
+            "script": "eval.py",
+            "primary": "S3",
+            "arguments": ["/tmp/candidate.align"],
+        },
+    )
+    assert result.success
+    attempt = result.data["attempt"]
+    assert attempt["metrics"] == {"NC": 0.31, "S3": 0.18}
+    assert config["decision_pending"] is False
+
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python eval.py /tmp/candidate.align",
+            "cwd": ".",
+        },
+    )
+    assert config["successful_evaluator_runs"] == 0
+    assert config["decision_pending"] is False
+
+    Path("/tmp/candidate.align").write_text("third candidate\n", encoding="utf-8")
+    controller._execute_tool(
+        state,
+        {
+            "action": "run",
+            "command": "python eval.py /tmp/candidate.align",
+            "cwd": ".",
+        },
+    )
+    assert config["successful_evaluator_runs"] == 1
+
+
+def test_background_candidate_metric_is_gated_after_completion(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    candidate_path = (workspace / "candidate.align").resolve()
+    (workspace / "eval.py").write_text("print('S3=0.18')\n", encoding="utf-8")
+    (workspace / "solver.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(candidate_path)!r}).write_text('candidate\\n')\n"
+        "print('Final S3 = 0.23, NC = 0.07')\n"
+        f"print('Saved to {candidate_path}')\n",
+        encoding="utf-8",
+    )
+    controller = RunController.create(
+        "optimize a score",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "eval.py",
+            "content": "print('S3=0.18')\n",
+            "rationale": "Create evaluation script",
+        },
+    )
+    controller._execute_tool(
+        state, {"action": "run", "command": "python eval.py", "cwd": "."}
+    )
+    before = {item["id"] for item in controller.commands.recover()}
+    controller._execute_tool(
+        state,
+        {"action": "start", "command": "python solver.py", "cwd": "."},
+    )
+    created = [
+        item for item in controller.commands.recover() if item["id"] not in before
+    ]
+    assert len(created) == 1
+    command_id = created[0]["id"]
+    for _ in range(100):
+        controller._execute_tool(
+            state,
+            {"action": "poll", "command_id": command_id},
+        )
+        if controller.commands.describe(command_id)["status"] == "exited":
+            controller._refresh_waiting_jobs(state)
+            break
+    else:
+        pytest.fail("background Candidate did not finish")
+
+    config = state.runtime_config["managed_evaluation"]
+    assert config["decision_pending"] is True
+    assert config["pending_candidate_artifacts"] == [str(candidate_path)]
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert '"signal": "candidate_metric"' in events
+
+
+def test_metric_names_accept_multiple_assignments_on_one_line() -> None:
+    assert RunController._metric_names("S3=0.248294 NC=1.000000\n") == [
+        "S3",
+        "NC",
+    ]
 
 
 def test_long_horizon_uses_flat_flow_without_work_items(
@@ -507,6 +1167,39 @@ def test_controller_does_not_reserve_a_fixed_hardening_fraction(
 
     assert controller._deadline_transition(state) is False
     assert state.phase == "long_horizon_work"
+
+
+def test_foreground_run_uses_remaining_task_time_without_fixed_cap(
+    tmp_path: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "run a long foreground command",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    state.deadline.wall_time_seconds = 3_600
+    controller._deadline_elapsed_base = 10
+    observed: dict[str, float | None] = {}
+
+    def fake_run(command: str, **kwargs: object) -> ToolResult:
+        observed["timeout_seconds"] = kwargs.get("timeout_seconds")  # type: ignore[assignment]
+        return ToolResult("run", "cmd-test", True, 0.0, output="ok", exit_code=0)
+
+    monkeypatch.setattr(controller.commands, "run", fake_run)
+    controller._execute_tool(
+        state,
+        {"action": "run", "command": "long-command", "cwd": "."},
+    )
+
+    timeout = observed["timeout_seconds"]
+    assert timeout is not None
+    assert 3_500 < timeout < 3_600
 
 
 def test_mutation_evidence_cannot_accept_work_item(

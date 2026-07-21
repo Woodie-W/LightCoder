@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -414,8 +415,14 @@ class WorkspaceTools:
             shutil.rmtree(staging, ignore_errors=True)
 
     def _is_runtime_path(self, path: Path) -> bool:
+        resolved = path.resolve()
+        if any(
+            resolved == root or root in resolved.parents
+            for root in self.protected_paths
+        ):
+            return True
         try:
-            relative = path.resolve().relative_to(self.workspace)
+            relative = resolved.relative_to(self.workspace)
         except ValueError:
             return False
         if not relative.parts:
@@ -437,9 +444,6 @@ class WorkspaceTools:
 
 class CommandSupervisor:
     """Small job broker used by the LLM-facing run/start/poll/logs/stop tools."""
-
-    DEFAULT_RUN_TIMEOUT_SECONDS = 300.0
-    MAX_RUN_TIMEOUT_SECONDS = 1_200.0
 
     def __init__(self, tools: WorkspaceTools) -> None:
         self.tools = tools
@@ -471,16 +475,10 @@ class CommandSupervisor:
                 return self.start(
                     command, cwd=cwd, env=env
                 )
-            bounded_timeout = min(
-                self.MAX_RUN_TIMEOUT_SECONDS,
-                max(
-                    0.1,
-                    (
-                        timeout_seconds
-                        if timeout_seconds is not None
-                        else self.DEFAULT_RUN_TIMEOUT_SECONDS
-                    ),
-                ),
+            bounded_timeout = (
+                max(0.1, float(timeout_seconds))
+                if timeout_seconds is not None
+                else None
             )
             with log_path.open("w", encoding="utf-8") as log_handle:
                 process = subprocess.Popen(
@@ -508,7 +506,7 @@ class CommandSupervisor:
             # A stubborn process group is already signalled above; still
             # produce a recoverable tool result instead of trapping the agent.
             exit_code = 124
-            bounded_timeout = timeout_seconds or self.DEFAULT_RUN_TIMEOUT_SECONDS
+            bounded_timeout = float(timeout_seconds or 0.0)
         except (OSError, ToolPolicyError) as error:
             return ToolResult(
                 "run", command_id, False, time.monotonic() - started, output=str(error)
@@ -516,7 +514,7 @@ class CommandSupervisor:
 
         output = log_path.read_text(encoding="utf-8", errors="replace")
         if exit_code == 124:
-            output += f"\ncommand timed out after {bounded_timeout:.1f}s"
+            output += f"\ncommand timed out after {float(bounded_timeout):.1f}s"
         elif self._process_group_running(process.pid):
             # A foreground action that spawns `server &` is neither observable
             # nor controllable by later poll/stop actions.  Kill it and make
@@ -652,22 +650,51 @@ class CommandSupervisor:
                 if log_path.exists()
                 else ""
             )
+            try:
+                launched_at = datetime.fromisoformat(str(metadata["started_at"]))
+                if launched_at.tzinfo is None:
+                    launched_at = launched_at.replace(tzinfo=timezone.utc)
+                elapsed_seconds = max(
+                    0.0, (datetime.now(timezone.utc) - launched_at).total_seconds()
+                )
+            except (KeyError, TypeError, ValueError):
+                elapsed_seconds = 0.0
+            log_bytes = log_path.stat().st_size if log_path.exists() else 0
             status = "running" if running else "exited"
             metadata["status"] = status
             if exit_code is not None:
                 metadata["exit_code"] = exit_code
             metadata["polled_at"] = utc_now()
             self._write_metadata(command_id, metadata)
+            compact_output = self.tools.compact(output)
+            if running:
+                status_line = (
+                    f"job still running after {elapsed_seconds:.1f}s "
+                    f"(pid {pid}, log {log_bytes} bytes)"
+                )
+                if not compact_output:
+                    status_line += (
+                        "; no output yet. An empty log alone is not evidence of a "
+                        "stall; poll later unless there is independent failure evidence."
+                    )
+                compact_output = (
+                    f"{status_line}\n{compact_output}" if compact_output else status_line
+                )
             return ToolResult(
                 "poll",
                 new_id("poll"),
                 True,
                 time.monotonic() - started,
-                output=self.tools.compact(output),
+                output=compact_output,
                 raw_log=str(metadata["log"]),
                 background_id=command_id,
                 exit_code=exit_code,
-                data={"pid": pid, "status": status},
+                data={
+                    "pid": pid,
+                    "status": status,
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                    "log_bytes": log_bytes,
+                },
             )
         except (OSError, ValueError, KeyError) as error:
             return ToolResult(
@@ -800,6 +827,10 @@ class CommandSupervisor:
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
         return recovered
+
+    def describe(self, command_id: str) -> dict[str, Any]:
+        """Return durable managed-command metadata for controller routing."""
+        return self._read_metadata(command_id)
 
     def _metadata_path(self, command_id: str) -> Path:
         if not command_id.startswith("cmd-") or "/" in command_id:

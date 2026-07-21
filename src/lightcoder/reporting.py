@@ -30,6 +30,16 @@ def build_run_report(store: StateStore) -> dict[str, Any]:
         and managed_config.get("store")
         else None
     )
+    if managed_evaluation is not None and isinstance(managed_config, dict):
+        managed_evaluation.update(
+            {
+                "decision_pending": bool(managed_config.get("decision_pending")),
+                "declined": bool(managed_config.get("declined")),
+                "unmanaged_numeric_runs": int(
+                    managed_config.get("successful_evaluator_runs", 0)
+                ),
+            }
+        )
     if store.transcript_path.is_file():
         for line in store.transcript_path.read_text(
             encoding="utf-8", errors="replace"

@@ -10,6 +10,7 @@ from typing import Sequence
 
 from .controller import RunController
 from .evaluation import (
+    adopt_evaluator,
     evaluation_store,
     find_attempt,
     format_attempt,
@@ -119,11 +120,22 @@ Create .lightcoder-eval/metrics.toml:
 
 Changing either file automatically creates a new evaluator version. Scores are
 only compared when evaluator version, primary metric, and direction all match.
+
+To adopt a script that already prints `S3=0.5` (or `S3: 0.5`) and immediately
+record a baseline:
+  lightcoder eval --adopt evaluate.py --primary S3 -- graph1 graph2 result.align
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     eval_parser.add_argument("-m", "--message", default="")
+    eval_parser.add_argument("--adopt", type=Path, metavar="SCRIPT")
+    eval_parser.add_argument("--primary")
+    eval_parser.add_argument(
+        "--direction", choices=["maximize", "minimize"], default="maximize"
+    )
+    eval_parser.add_argument("--eval-timeout", type=float, default=600)
     _add_evaluation_location_options(eval_parser)
+    eval_parser.add_argument("evaluator_args", nargs=argparse.REMAINDER)
 
     eval_log = subparsers.add_parser("log", help="list managed evaluation attempts")
     _add_evaluation_location_options(eval_log)
@@ -279,6 +291,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(discover_runs(_state_root(args)), indent=2))
             return 0
         elif args.command == "eval":
+            evaluator_args = list(args.evaluator_args)
+            if evaluator_args[:1] == ["--"]:
+                evaluator_args = evaluator_args[1:]
+            if args.adopt:
+                if not args.primary:
+                    raise ValueError("--adopt requires --primary")
+                adopt_evaluator(
+                    args.workspace,
+                    args.adopt,
+                    primary=args.primary,
+                    direction=args.direction,
+                    arguments=evaluator_args,
+                    timeout_seconds=args.eval_timeout,
+                )
+            elif evaluator_args:
+                raise ValueError("evaluator arguments require --adopt")
             record = submit_evaluation(
                 args.workspace, store=args.store, message=args.message
             )

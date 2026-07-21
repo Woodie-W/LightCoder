@@ -22,7 +22,7 @@ Do not modify runtime metadata or harness-protected paths. Treat disk and tool r
 Keep private reasoning private; tool arguments should contain only the information needed to execute the action."""
 
 MANAGED_EVALUATION_CONTRACT = """OPTIONAL MANAGED EVALUATION
-When useful, write an evaluator in `.lightcoder-eval/evaluate.py` and metric definitions in `.lightcoder-eval/metrics.toml`, then invoke `lightcoder eval` through the run tool. It commits the current code and evaluator, runs that fixed revision, and compares only results produced by the same evaluator version. Ordinary tests remain valid local checks. This mechanism is optional; use `lightcoder eval --help` for the compact file contract."""
+For tasks where you repeatedly optimize a numeric score, first make an evaluator work locally, then use the `managed_eval` tool to record a reproducible baseline and compare later candidates. On its first call, pass the working evaluator script, primary metric, and its arguments; later calls can reuse that setup. Skip it for one-off checks. The benchmark's official grader remains authoritative."""
 
 
 class ContextManager:
@@ -284,10 +284,18 @@ class ContextManager:
         config = self._managed_evaluation_config(state)
         if config is None:
             return None
-        return evaluation_summary(
+        summary = evaluation_summary(
             self.tools.workspace,
             Path(str(config["store"])),
         )
+        if config.get("decision_pending"):
+            summary["decision_pending"] = True
+        if config.get("declined"):
+            summary["declined"] = True
+        unmanaged = int(config.get("successful_evaluator_runs", 0))
+        if unmanaged:
+            summary["unmanaged_numeric_runs"] = unmanaged
+        return summary
 
     @staticmethod
     def _compact_work_item(item: Any, *, evidence_limit: int = 5) -> dict[str, Any]:
