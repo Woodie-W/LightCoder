@@ -49,6 +49,19 @@ def test_command_timeout_terminates_process_group(
     assert "timed out" in result.output
 
 
+def test_broad_interpreter_kill_is_rejected_before_it_can_kill_the_agent(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    supervisor = CommandSupervisor(tools)
+
+    result = supervisor.run("pkill -9 -f python || true")
+    started = supervisor.start("killall python3")
+
+    assert not result.success and "generic Python" in result.output
+    assert not started.success and "generic Python" in started.output
+
+
 def test_edit_requires_an_unambiguous_exact_match(
     tmp_path: Path, skills_root: Path
 ) -> None:

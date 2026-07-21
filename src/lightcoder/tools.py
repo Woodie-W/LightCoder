@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -464,6 +465,7 @@ class CommandSupervisor:
         try:
             if not command.strip():
                 raise ToolPolicyError("command must not be empty")
+            self._reject_broad_interpreter_kill(command)
             workdir = self.tools.resolve_path(cwd)
             if not workdir.is_dir():
                 raise ToolPolicyError(f"cwd is not a directory: {cwd}")
@@ -552,6 +554,7 @@ class CommandSupervisor:
         try:
             if not command.strip():
                 raise ToolPolicyError("command must not be empty")
+            self._reject_broad_interpreter_kill(command)
             workdir = self.tools.resolve_path(cwd)
             if not workdir.is_dir():
                 raise ToolPolicyError(f"cwd is not a directory: {cwd}")
@@ -648,6 +651,33 @@ class CommandSupervisor:
                 "timeout_seconds": bounded_timeout,
             },
         )
+
+    @staticmethod
+    def _reject_broad_interpreter_kill(command: str) -> None:
+        """Keep a shell cleanup from terminating the resident agent process."""
+        generic = re.compile(r"\^?python(?:3(?:\.\d+)?)?(?:\.\*)?\$?$")
+        for segment in re.split(r"[;&|]+", command):
+            try:
+                tokens = shlex.split(segment)
+            except ValueError:
+                continue
+            if not tokens or Path(tokens[0]).name not in {"pkill", "killall"}:
+                continue
+            if Path(tokens[0]).name == "pkill":
+                targets = [
+                    tokens[index + 1]
+                    for index, token in enumerate(tokens[:-1])
+                    if token in {"-f", "--full"}
+                ]
+                if not targets:
+                    targets = [token for token in tokens[1:] if not token.startswith("-")]
+            else:
+                targets = [token for token in tokens[1:] if not token.startswith("-")]
+            if any(generic.fullmatch(target) for target in targets):
+                raise ToolPolicyError(
+                    "do not pkill/killall a generic Python interpreter; stop the "
+                    "known managed command or target the service module instead"
+                )
 
     def poll(self, command_id: str) -> ToolResult:
         started = time.monotonic()
