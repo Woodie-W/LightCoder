@@ -21,6 +21,7 @@ from .evaluation import (
     format_attempt,
     format_log,
     load_attempts,
+    parse_metric_lines,
     restore_attempt,
     submit_evaluation,
 )
@@ -691,9 +692,13 @@ class RunController:
             if not reason:
                 raise ValueError("skip_managed_eval requires a reason")
             config["decision_pending"] = False
-            fingerprint = str(config.pop("pending_candidate_fingerprint", ""))
+            candidate_fingerprint = config.pop("pending_candidate_fingerprint", "")
+            evaluator_fingerprint = config.pop("pending_evaluator_fingerprint", "")
+            fingerprint = str(candidate_fingerprint or evaluator_fingerprint)
             if fingerprint:
                 config["last_skipped_candidate_fingerprint"] = fingerprint
+            if evaluator_fingerprint:
+                config["successful_evaluator_runs"] = 0
             config.pop("pending_candidate_artifacts", None)
             config.pop("pending_evaluator_command", None)
             config.pop("pending_evaluator_cwd", None)
@@ -1093,6 +1098,7 @@ class RunController:
                 config["decision_pending"] = False
                 config["local_check_hint_shown"] = True
                 config["successful_evaluator_runs"] = 0
+                config.pop("pending_evaluator_fingerprint", None)
                 pending_command = str(config.pop("pending_evaluator_command", ""))
                 pending_cwd = str(config.pop("pending_evaluator_cwd", "."))
                 if script:
@@ -1281,15 +1287,13 @@ class RunController:
                 f"import {candidate_stem}",
                 f"from {candidate_stem} import",
             )
-        )
+        ) and self._command_uses_python(command_tokens)
         runs_evaluator = (
             action_name in {"bash", "run", "start"} or bool(completed_background_id)
         ) and (
             imports_candidate
-            or any(
-                self._looks_like_evaluator_script(name)
-                or (candidate_name and name == candidate_name)
-                for name in command_names
+            or self._command_executes_evaluator(
+                command_tokens, candidate_name=candidate_name
             )
         )
         test_markers = (
@@ -1390,6 +1394,8 @@ class RunController:
             config["decision_pending"] = True
             config["pending_evaluator_command"] = raw_command
             config["pending_evaluator_cwd"] = command_cwd
+            config["pending_evaluator_fingerprint"] = observation_fingerprint
+            config.pop("pending_candidate_fingerprint", None)
         elif candidate_metric:
             # A reusable evaluator has already passed its smoke/reference run,
             # and a later solver command is now producing a scored Candidate.
@@ -1398,6 +1404,7 @@ class RunController:
             config["decision_pending"] = True
             config.pop("pending_evaluator_command", None)
             config.pop("pending_evaluator_cwd", None)
+            config.pop("pending_evaluator_fingerprint", None)
             config["pending_candidate_artifacts"] = candidate_artifacts
             config["pending_candidate_fingerprint"] = candidate_fingerprint
         elif (
@@ -1540,18 +1547,48 @@ class RunController:
         ) or stem.endswith(tuple(f"_{root}" for root in roots))
 
     @staticmethod
+    def _command_uses_python(tokens: list[str]) -> bool:
+        return any(
+            re.fullmatch(r"(?:python|pypy)\d*(?:\.\d+)?", Path(token).name.lower())
+            for token in tokens
+        )
+
+    @classmethod
+    def _command_executes_evaluator(
+        cls, tokens: list[str], *, candidate_name: str
+    ) -> bool:
+        """Distinguish executing a score script from cat/grep/sed inspection."""
+        segment_start = 0
+        separators = {"&&", "||", ";", "|"}
+        interpreters = re.compile(
+            r"(?:python|pypy)\d*(?:\.\d+)?|bash|sh", re.IGNORECASE
+        )
+        for index, token in enumerate(tokens):
+            if token in separators:
+                segment_start = index + 1
+                continue
+            name = Path(token.rstrip(";,|&")).name.lower()
+            evaluator = cls._looks_like_evaluator_script(name) or bool(
+                candidate_name and name == candidate_name
+            )
+            if not evaluator:
+                continue
+            if index == segment_start:
+                return True
+            if any(
+                interpreters.fullmatch(Path(value).name)
+                for value in tokens[segment_start:index]
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _looks_like_metric_output(output: str) -> bool:
         return bool(RunController._metric_names(output))
 
     @staticmethod
     def _metric_names(output: str) -> list[str]:
-        names = re.findall(
-            r"(?i)(?<![\w./-])(?:(?:best|final|current|baseline|initial)\s+)?"
-            r"([a-z][a-z0-9_-]{0,31})\s*[:=]\s*"
-            r"-?(?:\d+(?:\.\d*)?|\.\d+)\s*%?",
-            output,
-        )
-        return list(dict.fromkeys(names))
+        return list(parse_metric_lines(output))
 
     def _reported_candidate_paths(self, output: str, cwd: str) -> list[str]:
         """Return durable files explicitly reported as produced Candidates."""

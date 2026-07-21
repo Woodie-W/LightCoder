@@ -292,6 +292,23 @@ print("NC: 1.0")
     assert '"score.txt"' in config
 
 
+def test_adopt_normalizes_natural_language_metric_name(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "score_golden.py"
+    source.write_text(
+        "print('Loaded 68186 golden test points')\n"
+        "print('Pass rate: 0.5431')\n",
+        encoding="utf-8",
+    )
+
+    adopt_evaluator(workspace, source, primary="pass_rate")
+    attempt = submit_evaluation(workspace, store=tmp_path / "store")
+
+    assert attempt["status"] == "completed"
+    assert attempt["metrics"]["pass_rate"] == pytest.approx(0.5431)
+
+
 def test_adopt_captures_external_candidate_at_stable_workspace_path(
     tmp_path: Path,
 ) -> None:

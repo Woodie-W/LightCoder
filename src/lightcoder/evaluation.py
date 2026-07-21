@@ -709,13 +709,18 @@ def _metric_validity(metrics: dict[str, int | float]) -> bool | None:
 def _parse_metric_lines(
     stdout: str, config: dict[str, Any]
 ) -> dict[str, int | float]:
+    parsed = parse_metric_lines(stdout)
     normalized: dict[str, int | float] = {}
-    for match in re.finditer(
-        r"(?mi)^\s*([a-z][a-z0-9_-]{0,31})\s*[:=]\s*"
-        r"(-?(?:\d+(?:\.\d*)?|\.\d+))\s*%?\s*$",
-        stdout,
-    ):
-        normalized[match.group(1)] = float(match.group(2))
+    for name, value in parsed.items():
+        configured = next(
+            (
+                str(metric)
+                for metric in config.get("metrics", {})
+                if str(metric).casefold() == name.casefold()
+            ),
+            name,
+        )
+        normalized[configured] = value
     primary = str(config["primary"])
     if primary not in normalized:
         raise EvaluationError(
@@ -723,6 +728,24 @@ def _parse_metric_lines(
             f"`{primary}=0.5` for the primary metric"
         )
     return normalized
+
+
+def parse_metric_lines(stdout: str) -> dict[str, float]:
+    """Parse compact or natural metric labels from evaluator output."""
+    metrics: dict[str, float] = {}
+    for match in re.finditer(
+        r"(?i)(?<![\w./-])"
+        r"((?:(?:best|final|current|baseline|initial)[ \t]+)?"
+        r"[a-z][a-z0-9_-]*(?:[ \t]+[a-z][a-z0-9_-]*){0,2})"
+        r"\s*[:=]\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\s*%?",
+        stdout,
+    ):
+        name = re.sub(r"[ \t]+", "_", match.group(1).strip())
+        name = re.sub(
+            r"(?i)^(?:best|final|current|baseline|initial)_", "", name
+        )
+        metrics[name] = float(match.group(2))
+    return metrics
 
 
 def _portable_workspace_argument(

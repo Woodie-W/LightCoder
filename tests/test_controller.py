@@ -467,6 +467,87 @@ def test_managed_evaluation_reminds_after_authored_evaluator_runs(
     assert "managed_evaluator_detected" in events
 
 
+def test_reading_evaluator_does_not_execute_it_and_skip_deduplicates_run(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "inspect then run a scorer",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    controller._execute_tool(
+        state,
+        {
+            "action": "write",
+            "path": "score_golden.py",
+            "content": "print('Pass rate: 0.5431')\n",
+            "rationale": "Create scoring script",
+        },
+    )
+    config = state.runtime_config["managed_evaluation"]
+
+    for _ in range(2):
+        controller._execute_tool(
+            state,
+            {
+                "action": "run",
+                "command": "cat score_golden.py",
+                "cwd": ".",
+                "rationale": "Check the scorer source",
+            },
+        )
+    assert config["successful_evaluator_runs"] == 0
+    assert config["decision_pending"] is False
+
+    for _ in range(2):
+        controller._execute_tool(
+            state,
+            {
+                "action": "run",
+                "command": "python3 score_golden.py 2>&1 | tail -30",
+                "cwd": ".",
+            },
+        )
+    assert config["successful_evaluator_runs"] == 2
+    assert config["decision_pending"] is True
+
+    controller._apply_action(
+        state,
+        {"action": "skip_managed_eval", "reason": "not comparable yet"},
+    )
+    for _ in range(2):
+        controller._execute_tool(
+            state,
+            {
+                "action": "run",
+                "command": "python3 score_golden.py 2>&1 | tail -30",
+                "cwd": ".",
+            },
+        )
+    assert config["successful_evaluator_runs"] == 0
+    assert config["decision_pending"] is False
+
+    (workspace / "candidate.txt").write_text("changed\n", encoding="utf-8")
+    for _ in range(2):
+        controller._execute_tool(
+            state,
+            {
+                "action": "run",
+                "command": "python3 score_golden.py 2>&1 | tail -30",
+                "cwd": ".",
+            },
+        )
+    assert config["successful_evaluator_runs"] == 2
+    assert config["decision_pending"] is True
+
+
 def test_generic_evaluation_utility_is_not_misclassified_as_evaluator(
     tmp_path: Path, skills_root: Path
 ) -> None:
@@ -751,6 +832,7 @@ def test_metric_names_accept_multiple_assignments_on_one_line() -> None:
         "S3",
         "NC",
     ]
+    assert RunController._metric_names("Pass rate: 0.5431\n") == ["Pass_rate"]
 
 
 def test_long_horizon_uses_flat_flow_without_work_items(
