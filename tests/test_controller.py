@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from lightcoder.controller import RunController, native_tool_schemas
-from lightcoder.evaluation import load_attempts
+from lightcoder.evaluation import load_attempts, submit_evaluation
 from lightcoder.model import ModelError, ModelResponse, PermanentModelError
 from lightcoder.models import TaskProfile, WorkItem
 from lightcoder.reporting import build_run_report
@@ -1055,6 +1055,62 @@ def test_optimization_deadline_restores_last_accepted_checkpoint(
     assert "best_checkpoint_restored" in controller.store.events_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_deadline_restores_best_explicitly_valid_managed_attempt(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "result.align"
+    score = workspace / "score.txt"
+    valid = workspace / "valid.txt"
+    artifact.write_text("best\n", encoding="utf-8")
+    score.write_text("10\n", encoding="utf-8")
+    valid.write_text("true\n", encoding="utf-8")
+    evaluator = workspace / ".lightcoder-eval"
+    evaluator.mkdir()
+    (evaluator / "evaluate.py").write_text(
+        "import json\nfrom pathlib import Path\n"
+        "print(json.dumps({'valid': Path('valid.txt').read_text().strip() == 'true', "
+        "'metrics': {'score': int(Path('score.txt').read_text())}}))\n",
+        encoding="utf-8",
+    )
+    (evaluator / "metrics.toml").write_text(
+        'primary = "score"\n[metrics.score]\ndirection = "maximize"\n',
+        encoding="utf-8",
+    )
+    controller = RunController.create(
+        "preserve best valid result",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    store = Path(state.runtime_config["managed_evaluation"]["store"])
+    first = submit_evaluation(
+        workspace, store=store, state_root=controller.store.root
+    )
+    assert first["valid"] is True
+
+    artifact.write_text("invalid-high-score\n", encoding="utf-8")
+    score.write_text("100\n", encoding="utf-8")
+    valid.write_text("false\n", encoding="utf-8")
+    invalid = submit_evaluation(
+        workspace, store=store, state_root=controller.store.root
+    )
+    assert invalid["valid"] is False
+    artifact.write_text("unfinished\n", encoding="utf-8")
+
+    state.deadline.wall_time_seconds = 1
+    controller._deadline_elapsed_base = 2
+    assert controller._deadline_transition(state) is True
+    assert artifact.read_text(encoding="utf-8") == "best\n"
+    events = controller.store.events_path.read_text(encoding="utf-8")
+    assert '"kind": "managed_evaluation_best_restored"' in events
+    assert f'"attempt_id": "{first["id"]}"' in events
 
 
 def test_non_improving_checkpoint_does_not_replace_best(

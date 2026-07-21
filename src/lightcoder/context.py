@@ -22,7 +22,7 @@ Do not modify runtime metadata or harness-protected paths. Treat disk and tool r
 Keep private reasoning private; tool arguments should contain only the information needed to execute the action."""
 
 MANAGED_EVALUATION_CONTRACT = """OPTIONAL MANAGED EVALUATION
-For tasks where you repeatedly optimize a numeric score, first make an evaluator work locally, then use the `managed_eval` tool to record a reproducible baseline and compare later candidates. On its first call, pass the working evaluator script, primary metric, and its arguments; later calls can reuse that setup. Skip it for one-off checks. The benchmark's official grader remains authoritative."""
+For tasks where you repeatedly optimize a numeric score, first make an evaluator work locally, then use the `managed_eval` tool to record a reproducible baseline and compare later candidates. On its first call, pass the working evaluator script, primary metric, and its arguments; later calls can reuse that setup. When completeness or legality matters, emit top-level JSON `valid: true` only after checking it; only explicitly valid attempts can be restored automatically at final verification or the deadline. Skip managed evaluation for one-off checks. The benchmark's official grader remains authoritative."""
 
 
 class ContextManager:

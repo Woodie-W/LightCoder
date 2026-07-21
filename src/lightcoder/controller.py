@@ -16,6 +16,7 @@ from .context import ContextManager
 from .evaluation import (
     EvaluationError,
     adopt_evaluator,
+    best_valid_attempt,
     evaluation_store,
     format_attempt,
     format_log,
@@ -791,6 +792,7 @@ class RunController:
         if name == "rotate_context" and state.phase != "done":
             return
         if name == "begin_final_verification" and state.phase == "long_horizon_work":
+            self._restore_best_artifact(state, reason="final_verification")
             state.phase = "final_verify"
             state.active_work_item_id = None
             state.final["verification_started_at"] = utc_now()
@@ -2085,7 +2087,7 @@ class RunController:
             terminated = self._terminate_managed_jobs(
                 state, reason="deadline"
             )
-            self._restore_best_checkpoint_at_deadline(state)
+            self._restore_best_artifact(state, reason="deadline")
             state.status = "paused_limit"
             state.final["limit"] = {
                 "elapsed_seconds": elapsed,
@@ -2157,6 +2159,41 @@ class RunController:
                 "workspace_revision": self.tools.workspace_revision(),
             },
         )
+
+    def _restore_best_artifact(self, state: RunState, *, reason: str) -> None:
+        """Prefer an explicitly valid managed result, then a legacy checkpoint."""
+        config = state.runtime_config.get("managed_evaluation", {})
+        if isinstance(config, dict) and config.get("enabled"):
+            store = evaluation_store(
+                self.tools.workspace, Path(str(config["store"]))
+            )
+            attempt = best_valid_attempt(store)
+            if attempt is not None:
+                try:
+                    restore_attempt(
+                        self.tools.workspace,
+                        str(attempt["id"]),
+                        store=store,
+                        excluded_paths=[self.store.root],
+                        force=True,
+                    )
+                except (EvaluationError, OSError) as error:
+                    self.store.append_event(
+                        "managed_evaluation_best_restore_failed",
+                        {"attempt_id": attempt["id"], "error": str(error)},
+                    )
+                else:
+                    self.store.append_event(
+                        "managed_evaluation_best_restored",
+                        {
+                            "attempt_id": attempt["id"],
+                            "reason": reason,
+                            "metrics": attempt.get("metrics", {}),
+                            "workspace_revision": self.tools.workspace_revision(),
+                        },
+                    )
+                    return
+        self._restore_best_checkpoint_at_deadline(state)
 
     def _commit(self, state: RunState) -> RunState:
         return self.store.commit(state, expected_revision=state.revision)

@@ -9,6 +9,7 @@ import pytest
 from lightcoder.evaluation import (
     EvaluationError,
     adopt_evaluator,
+    best_valid_attempt,
     evaluation_summary,
     load_attempts,
     restore_attempt,
@@ -109,6 +110,34 @@ def test_failed_evaluator_is_recorded(tmp_path: Path) -> None:
     assert "broken evaluator" in Path(attempt["log"]).read_text(encoding="utf-8")
 
 
+def test_only_explicitly_valid_attempts_are_best_restore_candidates(
+    tmp_path: Path,
+) -> None:
+    workspace = initialize_workspace(tmp_path)
+    store = tmp_path / "store"
+    (workspace / "valid.txt").write_text("true\n", encoding="utf-8")
+    (workspace / ".lightcoder-eval" / "evaluate.py").write_text(
+        "import json\nfrom pathlib import Path\n"
+        "score = int(Path('score.txt').read_text())\n"
+        "valid = Path('valid.txt').read_text().strip() == 'true'\n"
+        "print(json.dumps({'valid': valid, 'metrics': {'partial': score}}))\n",
+        encoding="utf-8",
+    )
+
+    first = submit_evaluation(workspace, store=store)
+    assert first["valid"] is True
+
+    (workspace / "score.txt").write_text("100\n", encoding="utf-8")
+    (workspace / "valid.txt").write_text("false\n", encoding="utf-8")
+    invalid = submit_evaluation(workspace, store=store)
+    assert invalid["valid"] is False
+    assert invalid["comparison"]["classification"] == "invalid"
+
+    best = best_valid_attempt(store)
+    assert best is not None
+    assert best["id"] == first["id"]
+
+
 def test_runtime_state_is_not_committed_with_solution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -206,7 +235,8 @@ def test_snapshot_backend_submits_and_restores_without_git(
     evaluator.mkdir()
     (evaluator / "evaluate.py").write_text(
         "import json\nfrom pathlib import Path\n"
-        "print(json.dumps({'metrics': {'partial': int(Path('score.txt').read_text())}}))\n",
+        "print(json.dumps({'valid': True, 'metrics': "
+        "{'partial': int(Path('score.txt').read_text())}}))\n",
         encoding="utf-8",
     )
     (evaluator / "metrics.toml").write_text(
@@ -223,8 +253,10 @@ def test_snapshot_backend_submits_and_restores_without_git(
     (workspace / "later.txt").write_text("later\n", encoding="utf-8")
     second = submit_evaluation(workspace, store=store, message="second")
     assert second["comparison"]["classification"] == "improved"
+    assert second["valid"] is True
 
-    restore_attempt(workspace, first["id"], store=store)
+    (workspace / "later.txt").write_text("dirty after evaluation\n", encoding="utf-8")
+    restore_attempt(workspace, first["id"], store=store, force=True)
     assert (workspace / "score.txt").read_text(encoding="utf-8") == "4\n"
     assert not (workspace / "later.txt").exists()
 

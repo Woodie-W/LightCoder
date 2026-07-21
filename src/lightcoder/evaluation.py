@@ -180,6 +180,7 @@ def submit_evaluation(
         "primary_metric": primary,
         "direction": direction,
         "status": execution["status"],
+        "valid": execution.get("valid"),
         "duration_seconds": round(duration, 6),
         "metrics": execution.get("metrics", {}),
         "test_points": execution.get("test_points", []),
@@ -233,6 +234,7 @@ def restore_attempt(
     *,
     store: Path | None = None,
     excluded_paths: list[Path] | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     workspace = workspace.expanduser().resolve()
     destination = evaluation_store(workspace, store)
@@ -245,7 +247,11 @@ def restore_attempt(
         exclusions.extend(excluded_paths or [])
         latest = load_attempts(destination)[-1]
         expected = str(latest.get("workspace_hash", ""))
-        if expected and _hash_workspace(workspace, exclusions) != expected:
+        if (
+            not force
+            and expected
+            and _hash_workspace(workspace, exclusions) != expected
+        ):
             raise EvaluationError(
                 "workspace has uncommitted changes; run `lightcoder eval` before restore"
             )
@@ -262,7 +268,7 @@ def restore_attempt(
         if relative.parts:
             pathspecs.append(f":(exclude){relative.as_posix()}/**")
     dirty = _git(repo, "status", "--porcelain", "--", *pathspecs).stdout.strip()
-    if dirty:
+    if dirty and not force:
         raise EvaluationError(
             "workspace has uncommitted changes; run `lightcoder eval`, commit them, "
             "or clean them before checkout"
@@ -279,6 +285,27 @@ def restore_attempt(
         *pathspecs,
     )
     return attempt
+
+
+def best_valid_attempt(store: Path) -> dict[str, Any] | None:
+    """Return the best explicitly valid result under the latest evaluator."""
+    completed = [
+        item for item in load_attempts(store) if item.get("status") == "completed"
+    ]
+    if not completed:
+        return None
+    latest = completed[-1]
+    comparable = [
+        item
+        for item in completed
+        if item.get("valid") is True
+        and item.get("evaluator_hash") == latest.get("evaluator_hash")
+        and item.get("primary_metric") == latest.get("primary_metric")
+        and item.get("direction") == latest.get("direction")
+    ]
+    return _best_attempt(
+        comparable, str(latest["primary_metric"]), str(latest["direction"])
+    )
 
 
 def evaluation_summary(workspace: Path, store: Path | None = None) -> dict[str, Any]:
@@ -421,7 +448,9 @@ def _run_evaluator(
             "log": log,
         }
     try:
-        normalized, test_points = _parse_evaluator_output(result.stdout, config)
+        normalized, test_points, valid = _parse_evaluator_output(
+            result.stdout, config
+        )
     except (KeyError, json.JSONDecodeError, EvaluationError) as error:
         return {
             "status": "failed",
@@ -434,6 +463,7 @@ def _run_evaluator(
         "return_code": result.returncode,
         "metrics": normalized,
         "test_points": test_points,
+        "valid": valid,
         "log": log,
     }
 
@@ -483,10 +513,16 @@ def _commit_workspace(
 
 
 def _comparison(record: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    if record.get("valid") is False:
+        return {
+            "classification": "invalid",
+            "summary": "candidate failed evaluator legality checks",
+        }
     comparable = [
         item
         for item in attempts
         if item.get("status") == "completed"
+        and item.get("valid") is not False
         and item.get("evaluator_hash") == record.get("evaluator_hash")
         and item.get("primary_metric") == record.get("primary_metric")
         and item.get("direction") == record.get("direction")
@@ -518,7 +554,8 @@ def _best_attempt(
     usable = [
         item
         for item in attempts
-        if isinstance(item.get("metrics"), dict)
+        if item.get("valid") is not False
+        and isinstance(item.get("metrics"), dict)
         and isinstance(item["metrics"].get(primary), (int, float))
     ]
     if not usable:
@@ -537,6 +574,7 @@ def _compact_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
         "evaluator": attempt.get("evaluator"),
         "primary_metric": primary,
         "value": metrics.get(primary) if isinstance(metrics, dict) else None,
+        "valid": attempt.get("valid"),
     }
 
 
@@ -620,11 +658,12 @@ def _last_json_object(stdout: str) -> dict[str, Any]:
 
 def _parse_evaluator_output(
     stdout: str, config: dict[str, Any]
-) -> tuple[dict[str, int | float], list[Any]]:
+) -> tuple[dict[str, int | float], list[Any], bool | None]:
     try:
         payload = _last_json_object(stdout)
     except (json.JSONDecodeError, EvaluationError):
-        return _parse_metric_lines(stdout, config), []
+        metrics = _parse_metric_lines(stdout, config)
+        return metrics, [], _plain_validity(stdout, metrics)
     metrics = payload["metrics"]
     if not isinstance(metrics, dict):
         raise EvaluationError("evaluator output `metrics` must be an object")
@@ -643,7 +682,28 @@ def _parse_evaluator_output(
     test_points = payload.get("test_points", [])
     if not isinstance(test_points, list):
         raise EvaluationError("evaluator output `test_points` must be a list")
-    return normalized, test_points
+    valid = payload.get("valid")
+    if valid is not None and not isinstance(valid, bool):
+        raise EvaluationError("evaluator output `valid` must be a boolean")
+    if valid is None:
+        valid = _metric_validity(normalized)
+    return normalized, test_points, valid
+
+
+def _plain_validity(
+    stdout: str, metrics: dict[str, int | float]
+) -> bool | None:
+    matches = re.findall(r"(?mi)^\s*valid\s*[:=]\s*(true|false)\s*$", stdout)
+    if matches:
+        return matches[-1].lower() == "true"
+    return _metric_validity(metrics)
+
+
+def _metric_validity(metrics: dict[str, int | float]) -> bool | None:
+    value = metrics.get("valid")
+    if value not in {0, 1}:
+        return None
+    return bool(value)
 
 
 def _parse_metric_lines(

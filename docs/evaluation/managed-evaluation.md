@@ -19,11 +19,14 @@ The agent owns two normal workspace files:
 last non-empty stdout line must be one JSON object:
 
 ```json
-{"metrics": {"partial": 0.5, "passed": 5, "total": 10}, "test_points": []}
+{"valid": true, "metrics": {"partial": 0.5, "passed": 5, "total": 10}, "test_points": []}
 ```
 
 Metrics must be numeric. `test_points` is optional but, when present, must be a
-JSON list. Diagnostic output may precede the final JSON line.
+JSON list. `valid` is optional; use it when a Candidate has completeness or
+legality requirements. Only attempts that explicitly report `valid: true` are
+eligible for automatic best-artifact restoration. Diagnostic output may precede
+the final JSON line.
 
 `metrics.toml` declares the comparison contract using only Python's standard
 library:
@@ -74,6 +77,12 @@ The native tool supports three operations:
 - `restore` restores the exact Candidate from `attempt_id`. The Git backend does
   not move `HEAD`; both backends refuse to overwrite work changed since the
   latest submission.
+
+At final verification and the task deadline, the controller restores the best
+explicitly valid attempt under the latest evaluator. If no such attempt exists,
+it leaves managed-evaluation snapshots alone and falls back to any traditional
+validated checkpoint. This keeps one validity gate and one version store without
+making managed evaluation mandatory.
 
 When Git is available, `eval` stages and commits the current workspace and
 evaluates that fixed commit in a detached temporary worktree. If the task image
