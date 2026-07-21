@@ -13,6 +13,8 @@ from harbor.models.trial.paths import EnvironmentPaths
 
 class LightCoderHarborAgent(BaseInstalledAgent):
     SUPPORTS_RESUME = False
+    MANAGED_EVALUATION = True
+    ABLATIONS: tuple[str, ...] = ()
 
     _REMOTE_SRC_DIR = PurePosixPath("/installed-agent/lightcoder")
     _REMOTE_RUNTIME_DIR = PurePosixPath("/installed-agent/python-runtime")
@@ -190,6 +192,14 @@ class LightCoderHarborAgent(BaseInstalledAgent):
         escaped_report_path = shlex.quote(report_path)
         escaped_final_state_path = shlex.quote(final_state_path)
         escaped_remote_src = shlex.quote(remote_src)
+        experiment_options: list[str] = []
+        if self.MANAGED_EVALUATION:
+            experiment_options.append("--managed-eval")
+        for ablation in self.ABLATIONS:
+            experiment_options.extend(("--ablation", ablation))
+        escaped_experiment_options = " ".join(
+            shlex.quote(value) for value in experiment_options
+        )
 
         command = f"""
 set -euo pipefail
@@ -216,7 +226,7 @@ STATUS=0
   --base-url {shlex.quote(base_url)} \
   --model {shlex.quote(model)} \
   --context-window 128000 \
-  --managed-eval \
+  {escaped_experiment_options} \
   --watch \
   > {escaped_final_state_path} 2> >(stdbuf -oL tee {escaped_output_path} >&2) || STATUS=$?
 RUN_ID="$(find {escaped_state_root}/runs -mindepth 1 -maxdepth 1 -type d | sort | tail -n1 | xargs -r basename || true)"
@@ -274,3 +284,41 @@ exit "$STATUS"
             "managed_evaluation": report.get("managed_evaluation"),
             "phase": report.get("phase"),
         }
+
+
+class LightCoderA0FullAgent(LightCoderHarborAgent):
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-a0-full"
+
+
+class LightCoderA1WorkGraphAgent(LightCoderHarborAgent):
+    ABLATIONS = ("standard-only",)
+
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-a1-work-graph"
+
+
+class LightCoderA2NoHandoffsAgent(LightCoderHarborAgent):
+    ABLATIONS = ("no-handoffs",)
+
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-a2-no-handoffs"
+
+
+class LightCoderA3NoCheckpointsAgent(LightCoderHarborAgent):
+    ABLATIONS = ("no-checkpoints",)
+
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-a3-no-checkpoints"
+
+
+class LightCoderA4NoManagedEvalAgent(LightCoderHarborAgent):
+    MANAGED_EVALUATION = False
+
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-a4-no-managed-eval"
