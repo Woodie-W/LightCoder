@@ -103,8 +103,10 @@ class LightCoderHarborAgent(BaseInstalledAgent):
                     "LIGHTCODER_WALL_TIME_SECONDS must be at least 300"
                 )
         else:
-            seconds = self._AGENT_TIMEOUT_BY_TASK.get(task_name, 14400)
-        seconds = max(60, seconds - 120)
+            # Leave a small cleanup margin inside the official task timeout.
+            seconds = max(
+                60, self._AGENT_TIMEOUT_BY_TASK.get(task_name, 14400) - 120
+            )
         return f"{seconds}s"
 
     def _model_and_base_url(self) -> tuple[str, str, str]:
