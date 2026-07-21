@@ -157,6 +157,41 @@ def test_managed_evaluation_native_tool_adopts_and_records_baseline(
     assert build_run_report(controller.store)["managed_evaluation"]["attempts"] == 1
 
 
+def test_invalid_managed_candidate_is_recorded_but_not_successful_evidence(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "evaluate.py").write_text(
+        "print('{\"valid\": false, \"metrics\": {\"partial\": 1}}')\n",
+        encoding="utf-8",
+    )
+    controller = RunController.create(
+        "reject invalid candidate",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+
+    result = controller._execute_managed_evaluation(
+        state,
+        {
+            "action": "managed_eval",
+            "script": "evaluate.py",
+            "primary": "partial",
+        },
+    )
+
+    assert result.success is False
+    assert result.exit_code == 0
+    assert result.data["attempt"]["valid"] is False
+    assert state.runtime_config["managed_evaluation"]["decision_pending"] is False
+
+
 def test_managed_evaluation_history_restore_and_embedded_state_isolation(
     tmp_path: Path, skills_root: Path
 ) -> None:
@@ -288,7 +323,49 @@ def test_background_evaluator_counts_once_when_poll_observes_completion(
     assert config["successful_evaluator_runs"] == 2
 
 
-def test_running_poll_waits_and_controller_refresh_avoids_model_calls(
+def test_failed_background_evaluator_is_not_counted(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "evaluate.py").write_text(
+        "print('S3=0.9')\nraise SystemExit(7)\n", encoding="utf-8"
+    )
+    controller = RunController.create(
+        "reject failed scores",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+        managed_evaluation=True,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    state.runtime_config["managed_evaluation"]["candidate_evaluator_path"] = (
+        "evaluate.py"
+    )
+    controller._execute_tool(
+        state, {"action": "start", "command": "python evaluate.py", "cwd": "."}
+    )
+    command_id = controller.commands.recover()[0]["id"]
+    deadline = time.monotonic() + 2
+    while True:
+        controller._execute_tool(
+            state, {"action": "poll", "command_id": command_id}
+        )
+        result = controller.commands.describe(command_id)
+        if result.get("status") == "exited":
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    config = state.runtime_config["managed_evaluation"]
+    assert result["exit_code"] == 7
+    assert config["successful_evaluator_runs"] == 0
+    assert config["decision_pending"] is False
+
+
+def test_poll_keeps_service_interactive_and_explicit_wait_avoids_model_calls(
     tmp_path: Path, skills_root: Path
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -306,7 +383,7 @@ def test_running_poll_waits_and_controller_refresh_avoids_model_calls(
         state,
         {
             "action": "start",
-            "command": "sleep 0.2; printf finished",
+            "command": "sleep 0.5; printf finished",
             "cwd": ".",
             "timeout_seconds": 2,
         },
@@ -315,12 +392,33 @@ def test_running_poll_waits_and_controller_refresh_avoids_model_calls(
     controller._execute_tool(
         state, {"action": "poll", "command_id": command_id}
     )
+    assert state.status != "waiting"
+    controller._execute_tool(
+        state,
+        {"action": "run", "command": "printf interactive", "cwd": "."},
+    )
+    assert "interactive" in controller.store.evidence_by_id(
+        [state.evidence_ids[-1]]
+    )[0].summary
+    tool_names = {
+        item["function"]["name"]
+        for item in native_tool_schemas("long_horizon_work")
+    }
+    assert "wait" in tool_names
+    controller._apply_action(
+        state,
+        {
+            "action": "wait",
+            "command_id": command_id,
+            "reason": "no independent work remains",
+        },
+    )
     assert state.status == "waiting"
     assert controller._refresh_waiting_jobs(state) is True
     assert state.status == "waiting"
     assert state.counters.get("model_calls", 0) == 0
 
-    time.sleep(0.3)
+    time.sleep(0.6)
     assert controller._refresh_waiting_jobs(state) is False
     assert state.counters.get("model_calls", 0) == 0
     assert "waiting_command_ids" not in state.runtime_config
@@ -329,6 +427,72 @@ def test_running_poll_waits_and_controller_refresh_avoids_model_calls(
     events = controller.store.events_path.read_text(encoding="utf-8")
     assert "controller-managed waiting poll" not in events
     assert "managed_jobs_running" in events
+
+
+def test_explicit_wait_periodically_returns_control_for_a_live_service(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "recover from a mistaken service wait",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    started = controller.commands.start("sleep 10")
+    controller._apply_action(
+        state,
+        {
+            "action": "wait",
+            "command_id": started.background_id,
+            "reason": "mistakenly treated service as computation",
+        },
+    )
+    state.runtime_config["waiting_review_at"] = "2000-01-01T00:00:00+00:00"
+
+    assert controller._refresh_waiting_jobs(state) is False
+    assert "waiting_command_ids" not in state.runtime_config
+    assert controller.commands.poll(started.background_id).data["status"] == "running"
+    controller.commands.terminate(started.background_id, grace_seconds=0.1)
+
+
+def test_candidate_path_detection_accepts_saving_progressive(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    candidate = workspace / "result.align"
+    candidate.write_text("a\tb\n", encoding="utf-8")
+    controller = RunController.create(
+        "save a candidate",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+
+    assert controller._reported_candidate_paths(
+        f"Saving to {candidate}...\nDone.", "."
+    ) == [str(candidate)]
+
+
+def test_adoption_command_does_not_guess_among_multiple_metrics() -> None:
+    command = RunController._evaluator_adoption_command(
+        ["python3", "/opt/score_golden.py", "binary", "golden.jsonl"],
+        candidate_name="",
+        output="Total: 10, Passed: 4, Failed: 6\nPass rate: 0.4\n",
+    )
+    assert "--primary PRIMARY_METRIC" in command
+    assert "--primary Total" not in command
+
+    single = RunController._evaluator_adoption_command(
+        ["python3", "evaluate.py"], candidate_name="", output="S3=0.5\n"
+    )
+    assert "--primary S3" in single
 
 
 def test_submitted_candidate_rechecks_do_not_retrigger_until_candidate_changes(
@@ -987,7 +1151,7 @@ def test_final_delivery_stops_managed_jobs(
             "risks": [],
         },
     )
-    assert controller.commands.poll(started.background_id).data["status"] == "exited"
+    assert controller.commands.poll(started.background_id).data["status"] == "terminated"
 
 
 def test_long_horizon_bypasses_plan_generation(
@@ -1307,6 +1471,29 @@ def test_controller_does_not_reserve_a_fixed_hardening_fraction(
     assert state.phase == "long_horizon_work"
 
 
+def test_multi_hour_deadline_reserves_fixed_finalization_window(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "leave time for final state",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.deadline.wall_time_seconds = 3_600
+    controller._deadline_elapsed_base = 3_569
+    assert controller._deadline_transition(state) is False
+
+    controller._deadline_elapsed_base = 3_570
+    assert controller._deadline_transition(state) is True
+    assert state.final["limit"]["configured_seconds"] == 3_600
+    assert state.final["limit"]["work_seconds"] == 3_570
+
+
 def test_foreground_run_uses_remaining_task_time_without_fixed_cap(
     tmp_path: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1338,6 +1525,38 @@ def test_foreground_run_uses_remaining_task_time_without_fixed_cap(
     timeout = observed["timeout_seconds"]
     assert timeout is not None
     assert 3_500 < timeout < 3_600
+
+
+def test_automatic_mutation_check_uses_remaining_work_time(
+    tmp_path: Path, skills_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    controller = RunController.create(
+        "bound automatic checks",
+        workspace,
+        ScriptedModel([]),
+        state_root=tmp_path / "state",
+        skills_root=skills_root,
+    )
+    state = controller.store.load()
+    state.phase = "long_horizon_work"
+    state.deadline.wall_time_seconds = 3_600
+    controller._deadline_elapsed_base = 3_565
+    observed: dict[str, float | None] = {}
+
+    def fake_run(command: str, **kwargs: object) -> ToolResult:
+        observed["timeout_seconds"] = kwargs.get("timeout_seconds")  # type: ignore[assignment]
+        return ToolResult("run", "cmd-check", True, 0.0, output="ok", exit_code=0)
+
+    monkeypatch.setattr(controller.commands, "run", fake_run)
+    controller._execute_tool(
+        state, {"action": "write", "path": "module.py", "content": "value = 1\n"}
+    )
+
+    timeout = observed["timeout_seconds"]
+    assert timeout is not None
+    assert 0 < timeout <= 5
 
 
 def test_mutation_evidence_cannot_accept_work_item(

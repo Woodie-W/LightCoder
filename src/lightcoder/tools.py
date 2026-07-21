@@ -79,7 +79,8 @@ class WorkspaceTools:
         started = time.monotonic()
         call_id = new_id("read")
         try:
-            target = self.resolve_path(path)
+            value = Path(path).expanduser()
+            target = (value if value.is_absolute() else self.workspace / value).resolve()
             if not target.is_file():
                 raise FileNotFoundError(path)
             lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -586,7 +587,11 @@ class CommandSupervisor:
             if timeout_seconds is not None
             else None
         )
-        launched_command = command
+        exit_path = log_path.with_suffix(".exit")
+        exit_tmp = Path(f"{exit_path}.tmp")
+        exit_path.unlink(missing_ok=True)
+        exit_tmp.unlink(missing_ok=True)
+        launched_command = f"/bin/bash -lc {shlex.quote(command)}"
         if bounded_timeout is not None:
             # The wrapper is deliberately inside the managed process group.  It
             # survives a controller crash and enforces the task's own remaining
@@ -595,10 +600,16 @@ class CommandSupervisor:
                 "timeout --signal=TERM --kill-after=15s "
                 f"{bounded_timeout:.3f}s /bin/bash -lc {shlex.quote(command)}"
             )
+        wrapper = (
+            f"{launched_command}; status=$?; "
+            f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_tmp))}; "
+            f"mv -f {shlex.quote(str(exit_tmp))} {shlex.quote(str(exit_path))}; "
+            'exit "$status"'
+        )
         log_handle = log_path.open("w", encoding="utf-8")
         try:
             process = subprocess.Popen(
-                launched_command,
+                wrapper,
                 cwd=workdir,
                 env=env,
                 shell=True,
@@ -619,6 +630,7 @@ class CommandSupervisor:
             "started_at": utc_now(),
             "status": "running",
             "log": str(log_path.relative_to(self.tools.store.run_dir)),
+            "exit_status": str(exit_path.relative_to(self.tools.store.run_dir)),
             "timeout_seconds": bounded_timeout,
         }
         self._write_metadata(command_id, metadata)
@@ -642,8 +654,22 @@ class CommandSupervisor:
         try:
             metadata = self._read_metadata(command_id)
             pid = int(metadata["pid"])
-            exit_code = self._reap_exit_code(pid)
-            running = exit_code is None and self._metadata_process_running(metadata)
+            recorded_status = metadata.get("status")
+            terminated = recorded_status == "terminated"
+            exited = recorded_status == "exited"
+            exit_code = metadata.get("exit_code") if terminated else None
+            if exited:
+                exit_code = metadata.get("exit_code")
+                if exit_code is None:
+                    exit_code = self._persisted_exit_code(metadata)
+            elif not terminated:
+                persisted = self._persisted_exit_code(metadata)
+                reaped = self._reap_exit_code(pid)
+                exit_code = persisted if persisted is not None else reaped
+            running = (
+                recorded_status == "running"
+                and self._managed_process_running(metadata)
+            )
             log_path = self.tools.store.run_dir / str(metadata["log"])
             output = (
                 log_path.read_text(encoding="utf-8", errors="replace")
@@ -660,9 +686,9 @@ class CommandSupervisor:
             except (KeyError, TypeError, ValueError):
                 elapsed_seconds = 0.0
             log_bytes = log_path.stat().st_size if log_path.exists() else 0
-            status = "running" if running else "exited"
+            status = recorded_status if terminated or exited else "running" if running else "exited"
             metadata["status"] = status
-            if exit_code is not None:
+            if exit_code is not None and not running:
                 metadata["exit_code"] = exit_code
             metadata["polled_at"] = utc_now()
             self._write_metadata(command_id, metadata)
@@ -688,7 +714,7 @@ class CommandSupervisor:
                 output=compact_output,
                 raw_log=str(metadata["log"]),
                 background_id=command_id,
-                exit_code=exit_code,
+                exit_code=None if running else exit_code,
                 data={
                     "pid": pid,
                     "status": status,
@@ -754,15 +780,15 @@ class CommandSupervisor:
         try:
             metadata = self._read_metadata(command_id)
             pid = int(metadata["pid"])
-            if self._metadata_process_running(metadata):
+            if self._managed_process_running(metadata):
                 os.killpg(pid, signal.SIGTERM)
                 deadline = time.monotonic() + max(0.0, grace_seconds)
                 while (
-                    self._metadata_process_running(metadata)
+                    self._managed_process_running(metadata)
                     and time.monotonic() < deadline
                 ):
                     time.sleep(0.05)
-                if self._metadata_process_running(metadata):
+                if self._managed_process_running(metadata):
                     os.killpg(pid, signal.SIGKILL)
             metadata["status"] = "terminated"
             metadata["terminated_at"] = utc_now()
@@ -786,6 +812,16 @@ class CommandSupervisor:
 
     @staticmethod
     def _process_group_running(process_group_id: int) -> bool:
+        proc = Path("/proc")
+        if proc.is_dir():
+            for stat in proc.glob("[0-9]*/stat"):
+                try:
+                    fields = stat.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+                    if int(fields[2]) == process_group_id and fields[0] != "Z":
+                        return True
+                except (OSError, IndexError, ValueError):
+                    continue
+            return False
         try:
             os.killpg(process_group_id, 0)
         except ProcessLookupError:
@@ -817,10 +853,13 @@ class CommandSupervisor:
         for path in sorted(self.tools.store.commands_dir.glob("*.json")):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
-                if value.get(
-                    "status"
-                ) == "running" and not self._metadata_process_running(value):
+                exit_code = self._persisted_exit_code(value)
+                if value.get("status") == "running" and (
+                    not self._managed_process_running(value)
+                ):
                     value["status"] = "exited"
+                    if exit_code is not None:
+                        value["exit_code"] = exit_code
                     value["recovered_at"] = utc_now()
                     self._write_metadata(str(value["id"]), value)
                 recovered.append(value)
@@ -874,6 +913,20 @@ class CommandSupervisor:
         if expected is not None and self._process_start_ticks(pid) != int(expected):
             return False
         return self._pid_running(pid)
+
+    def _managed_process_running(self, metadata: dict[str, Any]) -> bool:
+        return self._metadata_process_running(metadata) or self._process_group_running(
+            int(metadata["pid"])
+        )
+
+    def _persisted_exit_code(self, metadata: dict[str, Any]) -> int | None:
+        relative = str(metadata.get("exit_status", ""))
+        if not relative:
+            return None
+        try:
+            return int((self.tools.store.run_dir / relative).read_text().strip())
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def _reap_exit_code(pid: int) -> int | None:

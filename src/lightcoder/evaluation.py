@@ -105,6 +105,7 @@ def submit_evaluation(
     state_root: Path | None = None,
     run_id: str = "",
     model: str = "",
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.expanduser().resolve()
     source_dir = workspace / EVALUATOR_DIRNAME
@@ -134,7 +135,10 @@ def submit_evaluation(
                 config = _load_metric_config(snapshot_evaluator)
                 evaluator_hash = _hash_directory(snapshot_evaluator)
                 execution = _run_evaluator(
-                    snapshot_workspace, snapshot_evaluator, config
+                    snapshot_workspace,
+                    snapshot_evaluator,
+                    config,
+                    timeout_seconds=timeout_seconds,
                 )
             finally:
                 _git(
@@ -157,7 +161,12 @@ def submit_evaluation(
         config = _load_metric_config(snapshot_evaluator)
         evaluator_hash = _hash_directory(snapshot_evaluator)
         workspace_hash = _hash_directory(snapshot_workspace)
-        execution = _run_evaluator(snapshot_workspace, snapshot_evaluator, config)
+        execution = _run_evaluator(
+            snapshot_workspace,
+            snapshot_evaluator,
+            config,
+            timeout_seconds=timeout_seconds,
+        )
         commit = f"snapshot-{workspace_hash}"
         solution = workspace_hash[:12]
         snapshot_path = str(snapshot_workspace)
@@ -346,9 +355,17 @@ def format_attempt(record: dict[str, Any]) -> str:
     value = record["metrics"][primary]
     comparison = record.get("comparison", {})
     detail = str(comparison.get("summary", "first comparable result"))
+    valid = record.get("valid")
+    validity = "true" if valid is True else "false" if valid is False else "unknown"
+    restore = (
+        "eligible for automatic best restore"
+        if valid is True
+        else "not eligible for automatic best restore"
+    )
     return (
         f"{record['id']} completed: {primary}={value} ({record['evaluator']})\n"
         f"comparison: {detail}\n"
+        f"valid={validity}; {restore}\n"
         f"commit={record['solution']} duration={record['duration_seconds']:.2f}s"
     )
 
@@ -356,16 +373,19 @@ def format_attempt(record: dict[str, Any]) -> str:
 def format_log(attempts: list[dict[str, Any]]) -> str:
     if not attempts:
         return "No managed evaluation attempts."
-    rows = ["ID     SOLUTION      EVALUATOR   STATUS      PRIMARY"]
+    rows = ["ID     SOLUTION      EVALUATOR   STATUS      VALID    PRIMARY"]
     for item in attempts:
         primary = str(item.get("primary_metric", ""))
         metrics = item.get("metrics", {})
         value = metrics.get(primary, "-") if isinstance(metrics, dict) else "-"
+        valid = item.get("valid")
+        validity = "true" if valid is True else "false" if valid is False else "unknown"
         rows.append(
             f"{str(item.get('id', '')):<6} "
             f"{str(item.get('solution', '')):<13} "
             f"{str(item.get('evaluator', '')):<11} "
             f"{str(item.get('status', '')):<11} "
+            f"{validity:<8} "
             f"{primary}={value}"
         )
     return "\n".join(rows)
@@ -411,7 +431,11 @@ def _load_metric_config(directory: Path) -> dict[str, Any]:
 
 
 def _run_evaluator(
-    workspace: Path, evaluator_dir: Path, config: dict[str, Any]
+    workspace: Path,
+    evaluator_dir: Path,
+    config: dict[str, Any],
+    *,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     configured_command = config.get("command")
     command = (
@@ -421,6 +445,12 @@ def _run_evaluator(
     )
     environment = os.environ.copy()
     environment["LIGHTCODER_EVAL_WORKSPACE"] = str(workspace)
+    configured_timeout = float(config.get("timeout_seconds", 600))
+    timeout = (
+        configured_timeout
+        if timeout_seconds is None
+        else min(configured_timeout, max(0.1, timeout_seconds))
+    )
     try:
         result = subprocess.run(
             command,
@@ -428,7 +458,7 @@ def _run_evaluator(
             env=environment,
             capture_output=True,
             text=True,
-            timeout=float(config.get("timeout_seconds", 600)),
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as error:
         stdout = error.stdout.decode() if isinstance(error.stdout, bytes) else error.stdout or ""
@@ -436,7 +466,7 @@ def _run_evaluator(
         return {
             "status": "failed",
             "return_code": 124,
-            "error": f"evaluator timed out after {config.get('timeout_seconds', 600)}s",
+            "error": f"evaluator timed out after {timeout:g}s",
             "log": _combined_log(stdout, stderr),
         }
     log = _combined_log(result.stdout, result.stderr)

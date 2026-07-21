@@ -48,7 +48,7 @@ PLAN_ACTIONS = """Return set_plan: call the set_plan tool with a small dependenc
 
 WORK_ACTIONS = """Use the provided tools to complete the active work item. Use run for foreground commands and start, poll, logs, and stop for observable services or long jobs; both remain bounded by the task wall time. Read before uncertain edits and run a focused check after mutations. Once the acceptance criteria are satisfied, call begin_verification, then accept_work_item with current evidence."""
 
-LONG_HORIZON_ACTIONS = """Use the provided tools to make measured progress toward a scoreable artifact. Keep decomposition advisory, preserve the best valid artifact, and use checkpoints after verified improvements. Long work must use start/poll/logs/stop; run is only for bounded foreground checks. Call begin_final_verification only after relevant checks succeed."""
+LONG_HORIZON_ACTIONS = """Use the provided tools to make measured progress toward a scoreable artifact. Keep decomposition advisory, preserve the best valid artifact, and use checkpoints after verified improvements. Long work must use start/poll/logs/stop; run is only for bounded foreground checks. After polling a computation, call wait only when no other useful work can proceed; do not wait on a service needed for interactive tests. Call begin_final_verification only after relevant checks succeed."""
 
 FINAL_VERIFY_ACTIONS = """Use run, read, and the provided tools for final integration checks. Call final_verified only with successful current-revision command evidence."""
 
@@ -163,7 +163,7 @@ def native_tool_schemas(
         ),
         _tool_schema(
             "read",
-            "Read a bounded line range from a workspace file.",
+            "Read a bounded line range from any task-visible file. Writes remain restricted to the workspace.",
             {"path": text, "start_line": integer, "max_lines": integer, "rationale": text},
             ["path"],
         ),
@@ -188,6 +188,15 @@ def native_tool_schemas(
     ]
     if managed_evaluation:
         common_tools.append(managed_evaluation_tool)
+    if phase in {"standard_work", "long_horizon_work"}:
+        common_tools.append(
+            _tool_schema(
+                "wait",
+                "Yield model calls for up to five minutes while one managed computation runs. If it is still running, control returns so you can inspect or wait again. Do not wait on an interactive service.",
+                {"command_id": text, "reason": text},
+                ["command_id", "reason"],
+            )
+        )
     if phase == "recon":
         return [
             _tool_schema(
@@ -809,17 +818,22 @@ class RunController:
             reason = str(action.get("reason", "")).strip()
             if not reason:
                 raise ValueError("wait requires a specific external event")
-            if not any(
-                command.get("status") == "running"
+            command_id = str(action.get("command_id", ""))
+            running = {
+                str(command["id"])
                 for command in self.commands.recover()
-            ):
-                raise ValueError(
-                    "wait requires a running managed job; run tool results are synchronous"
-                )
+                if command.get("status") == "running"
+            }
+            if command_id not in running:
+                raise ValueError("wait requires a running managed command_id")
+            state.runtime_config["waiting_command_ids"] = [command_id]
+            state.runtime_config["waiting_review_at"] = (
+                datetime.now(UTC) + timedelta(minutes=5)
+            ).isoformat()
             state.status = "waiting"
             self.store.append_event(
                 "run_waiting",
-                {"reason": reason, "resume_hint": action.get("resume_hint", "")},
+                {"reason": reason, "command_id": command_id},
             )
             return
         if name == "final_verified" and state.phase == "final_verify":
@@ -863,7 +877,7 @@ class RunController:
     def _execute_tool(self, state: RunState, action: dict[str, Any]) -> None:
         name = str(action["action"])
         self._validate_tool_action(action)
-        remaining = self._deadline_remaining(state)
+        remaining = self._work_remaining(state)
         if remaining is not None and remaining <= 0:
             raise ValueError("deadline reached before tool execution")
         if name in {"write", "edit"}:
@@ -944,24 +958,6 @@ class RunController:
         else:
             result = self.commands.terminate(str(action.get("command_id", "")))
         self._record_tool_result(state, action, result)
-        if name == "poll" and result.data.get("status") == "running":
-            waiting_ids = [
-                str(item["id"])
-                for item in self.commands.recover()
-                if item.get("status") == "running"
-            ]
-            if result.background_id and result.background_id not in waiting_ids:
-                waiting_ids.append(result.background_id)
-            state.runtime_config["waiting_command_ids"] = waiting_ids
-            state.status = "waiting"
-            self.store.append_event(
-                "run_waiting",
-                {
-                    "reason": "managed_job_running",
-                    "command_id": result.background_id,
-                    "elapsed_seconds": result.data.get("elapsed_seconds", 0),
-                },
-            )
 
     def _refresh_waiting_jobs(self, state: RunState) -> bool:
         """Poll live jobs without spending a model call while the run is waiting."""
@@ -992,9 +988,23 @@ class RunController:
             if result.data.get("status") == "running":
                 still_running.append(command_id)
         if still_running:
+            try:
+                review_due = datetime.now(UTC) >= datetime.fromisoformat(
+                    str(state.runtime_config.get("waiting_review_at", ""))
+                )
+            except (TypeError, ValueError):
+                review_due = True
+            if review_due:
+                state.runtime_config.pop("waiting_command_ids", None)
+                state.runtime_config.pop("waiting_review_at", None)
+                self.store.append_event(
+                    "managed_wait_review_due", {"command_ids": still_running}
+                )
+                return False
             state.runtime_config["waiting_command_ids"] = still_running
         else:
             state.runtime_config.pop("waiting_command_ids", None)
+            state.runtime_config.pop("waiting_review_at", None)
         if still_running:
             state.status = "waiting"
             self.store.append_event(
@@ -1092,9 +1102,10 @@ class RunController:
                 state_root=self.store.root,
                 run_id=state.run_id,
                 model=self.agent.model.model,
+                timeout_seconds=self._work_remaining(state),
             )
-            success = record.get("status") == "completed"
-            if success:
+            completed = record.get("status") == "completed"
+            if completed:
                 config["decision_pending"] = False
                 config["local_check_hint_shown"] = True
                 config["successful_evaluator_runs"] = 0
@@ -1121,10 +1132,10 @@ class RunController:
             return ToolResult(
                 "managed_eval",
                 call_id,
-                success,
+                completed and record.get("valid") is not False,
                 time.monotonic() - started,
                 output=format_attempt(record),
-                exit_code=0 if success else int(record.get("return_code") or 1),
+                exit_code=0 if completed else int(record.get("return_code") or 1),
                 affected_paths=[".lightcoder-eval"],
                 data={"attempt": record},
             )
@@ -1173,19 +1184,21 @@ class RunController:
             automatic_command = self._automatic_mutation_check(
                 str(action.get("path", ""))
             )
-            if automatic_command:
+            remaining = self._work_remaining(state)
+            if automatic_command and (remaining is None or remaining > 0):
+                timeout = 60.0 if remaining is None else min(60.0, remaining)
                 check_action = {
                     "action": "bash",
                     "command": automatic_command,
                     "cwd": ".",
-                    "timeout_seconds": 60,
+                    "timeout_seconds": timeout,
                     "background": False,
                     "rationale": "controller automatic post-mutation syntax check",
                 }
                 check_result = self.commands.run(
                     automatic_command,
                     cwd=".",
-                    timeout_seconds=60,
+                    timeout_seconds=timeout,
                     background=False,
                     env=self._managed_evaluation_env(state),
                 )
@@ -1332,6 +1345,7 @@ class RunController:
                 or bool(completed_background_id)
             )
             and result.success
+            and (not completed_background_id or result.exit_code == 0)
             and self._looks_like_metric_output(result.output)
         )
         candidate_artifacts = self._reported_candidate_paths(
@@ -1353,7 +1367,7 @@ class RunController:
         if runs_evaluator:
             if (
                 not result.success
-                or result.exit_code not in {0, None}
+                or result.exit_code != 0
                 or not self._looks_like_metric_output(result.output)
             ):
                 return
@@ -1448,8 +1462,11 @@ class RunController:
             "native `managed_eval` tool with this script, primary metric, and the "
             "same arguments, or call `skip_managed_eval` with a reason if these runs "
             "are genuinely not comparable. "
-            f"The equivalent human CLI is `{adoption_command}`. The official grader "
-            "remains authoritative."
+            f"The CLI template is `{adoption_command}`; replace PRIMARY_METRIC when "
+            "it appears. The official grader "
+            f"remains authoritative. Observed metric labels: "
+            f"{', '.join(self._metric_names(result.output))}; choose the metric that "
+            "represents task quality rather than a diagnostic count."
             if signal == "evaluator_script"
             else f"Your Candidate-producing command reported numeric metrics after "
             f"the reusable evaluator `{candidate_name}` had already passed a "
@@ -1506,7 +1523,8 @@ class RunController:
             ),
             None,
         )
-        primary = next(iter(cls._metric_names(output)), "partial")
+        metrics = cls._metric_names(output)
+        primary = metrics[0] if len(metrics) == 1 else "PRIMARY_METRIC"
         if script_index is None:
             source = candidate_name or "evaluate.py"
             return (
@@ -1605,6 +1623,7 @@ class RunController:
                 marker in lowered
                 for marker in (
                     "writing",
+                    "saving",
                     "written",
                     "wrote",
                     "saved",
@@ -1677,13 +1696,10 @@ class RunController:
         requested_value = (
             max(1.0, float(requested)) if requested is not None else None
         )
-        remaining = self._deadline_remaining(state)
+        remaining = self._work_remaining(state)
         if remaining is None:
             return requested_value
-        # Leave a small fixed window for final polling, verifier handoff, and
-        # controller-side process cleanup.  This is not a per-command limit.
-        task_bound = max(1.0, remaining - 30.0)
-        return min(requested_value, task_bound) if requested_value else task_bound
+        return min(requested_value, remaining) if requested_value else remaining
 
     def _record_control_tool_result(
         self, state: RunState, action: dict[str, Any]
@@ -2120,7 +2136,8 @@ class RunController:
             return False
         elapsed = self._deadline_elapsed()
         state.counters["elapsed_seconds"] = int(elapsed)
-        if elapsed >= limit:
+        work_limit = max(1.0, limit - self._finalization_reserve(state))
+        if elapsed >= work_limit:
             terminated = self._terminate_managed_jobs(
                 state, reason="deadline"
             )
@@ -2128,6 +2145,8 @@ class RunController:
             state.status = "paused_limit"
             state.final["limit"] = {
                 "elapsed_seconds": elapsed,
+                "configured_seconds": limit,
+                "work_seconds": work_limit,
                 "reached_at": utc_now(),
                 "clock": "monotonic_with_persisted_resume",
                 "terminated_command_ids": terminated,
@@ -2163,9 +2182,19 @@ class RunController:
             return None
         return state.deadline.wall_time_seconds - self._deadline_elapsed()
 
+    def _work_remaining(self, state: RunState) -> float | None:
+        remaining = self._deadline_remaining(state)
+        if remaining is None:
+            return None
+        return max(0.0, remaining - self._finalization_reserve(state))
+
+    @staticmethod
+    def _finalization_reserve(state: RunState) -> float:
+        return 30.0 if state.deadline.wall_time_seconds >= 3_600 else 0.0
+
     def _model_request_timeout(self, state: RunState) -> float | None:
         """Let one inference use the remaining task budget instead of a fixed cap."""
-        remaining = self._deadline_remaining(state)
+        remaining = self._work_remaining(state)
         return None if remaining is None else max(1.0, remaining)
 
     def _restore_best_checkpoint_at_deadline(self, state: RunState) -> None:

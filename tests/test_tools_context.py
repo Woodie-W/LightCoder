@@ -25,6 +25,10 @@ def test_workspace_tools_enforce_paths_and_keep_metadata_out_of_revision(
     tmp_path: Path, skills_root: Path
 ) -> None:
     _, store, tools, _ = make_runtime(tmp_path, skills_root)
+    reference = tmp_path / "reference.txt"
+    reference.write_text("task input\n", encoding="utf-8")
+    assert tools.read(str(reference)).success
+    assert tools.read("../reference.txt").success
     assert not tools.write("../escape.txt", "bad").success
     assert not tools.write(".lightcoder/overwrite", "bad").success
     assert tools.write("inside.txt", "ok\n").success
@@ -74,6 +78,43 @@ def test_background_command_preserves_identity_log_and_exit_code(
         time.sleep(0.02)
     assert result.exit_code == 0
     assert "finished" in result.output
+    assert supervisor.poll(started.background_id).data["status"] == "exited"
+
+
+def test_background_exit_code_survives_controller_process_change(
+    tmp_path: Path, skills_root: Path, monkeypatch
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    started = CommandSupervisor(tools).start("exit 7")
+    metadata = CommandSupervisor(tools).describe(started.background_id)
+    exit_path = tools.store.run_dir / metadata["exit_status"]
+    deadline = time.monotonic() + 2
+    while not exit_path.is_file():
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    monkeypatch.setattr(
+        CommandSupervisor, "_reap_exit_code", staticmethod(lambda _pid: None)
+    )
+    result = CommandSupervisor(tools).poll(started.background_id)
+
+    assert result.data["status"] == "exited"
+    assert result.exit_code == 7
+
+
+def test_background_descendant_remains_observable_and_stoppable(
+    tmp_path: Path, skills_root: Path
+) -> None:
+    _, _, tools, _ = make_runtime(tmp_path, skills_root)
+    supervisor = CommandSupervisor(tools)
+    started = supervisor.start("sleep 10 &")
+
+    result = supervisor.poll(started.background_id)
+    assert result.data["status"] == "running"
+    assert result.exit_code is None
+
+    supervisor.terminate(started.background_id, grace_seconds=0.1)
+    assert supervisor.poll(started.background_id).data["status"] == "terminated"
 
 
 def test_managed_job_has_an_independent_timeout_watchdog(
@@ -105,6 +146,8 @@ def test_poll_explains_that_silent_running_job_is_not_stalled(
     assert result.data["log_bytes"] == 0
     assert "empty log alone is not evidence of a stall" in result.output
     supervisor.terminate(started.background_id)
+    stopped = supervisor.poll(started.background_id)
+    assert stopped.data["status"] == "terminated"
 
 
 def test_run_does_not_hang_on_accidental_background_descendant(

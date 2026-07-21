@@ -11,6 +11,7 @@ from lightcoder.evaluation import (
     adopt_evaluator,
     best_valid_attempt,
     evaluation_summary,
+    format_attempt,
     load_attempts,
     restore_attempt,
     submit_evaluation,
@@ -108,6 +109,21 @@ def test_failed_evaluator_is_recorded(tmp_path: Path) -> None:
     assert attempt["return_code"] != 0
     assert load_attempts(store)[0]["id"] == attempt["id"]
     assert "broken evaluator" in Path(attempt["log"]).read_text(encoding="utf-8")
+
+
+def test_evaluator_timeout_is_capped_by_remaining_task_time(tmp_path: Path) -> None:
+    workspace = initialize_workspace(tmp_path)
+    (workspace / ".lightcoder-eval" / "evaluate.py").write_text(
+        "import time\ntime.sleep(10)\n", encoding="utf-8"
+    )
+
+    attempt = submit_evaluation(
+        workspace, store=tmp_path / "store", timeout_seconds=0.1
+    )
+
+    assert attempt["status"] == "failed"
+    assert attempt["return_code"] == 124
+    assert "0.1s" in attempt["error"]
 
 
 def test_only_explicitly_valid_attempts_are_best_restore_candidates(
@@ -307,6 +323,9 @@ def test_adopt_normalizes_natural_language_metric_name(tmp_path: Path) -> None:
 
     assert attempt["status"] == "completed"
     assert attempt["metrics"]["pass_rate"] == pytest.approx(0.5431)
+    assert "valid=unknown; not eligible for automatic best restore" in format_attempt(
+        attempt
+    )
 
 
 def test_adopt_captures_external_candidate_at_stable_workspace_path(
