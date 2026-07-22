@@ -14,6 +14,7 @@ from harbor.models.trial.paths import EnvironmentPaths
 class LightCoderHarborAgent(BaseInstalledAgent):
     SUPPORTS_RESUME = False
     MANAGED_EVALUATION = True
+    CONTEXT_WINDOW = 128_000
     ABLATIONS: tuple[str, ...] = ()
 
     _REMOTE_SRC_DIR = PurePosixPath("/installed-agent/lightcoder")
@@ -227,7 +228,7 @@ STATUS=0
   --skills {escaped_remote_src}/skills \
   --base-url {shlex.quote(base_url)} \
   --model {shlex.quote(model)} \
-  --context-window 128000 \
+  --context-window {self.CONTEXT_WINDOW} \
   {escaped_experiment_options} \
   --watch \
   > {escaped_final_state_path} 2> >(stdbuf -oL tee {escaped_output_path} >&2) || STATUS=$?
@@ -243,7 +244,7 @@ while [ -n "$RUN_ID" ]; do
     --skills {escaped_remote_src}/skills \
     --base-url {shlex.quote(base_url)} \
     --model {shlex.quote(model)} \
-    --context-window 128000 \
+    --context-window {self.CONTEXT_WINDOW} \
     --watch \
     > {escaped_final_state_path} 2> >(stdbuf -oL tee -a {escaped_output_path} >&2) || STATUS=$?
 done
@@ -324,3 +325,20 @@ class LightCoderA4NoManagedEvalAgent(LightCoderHarborAgent):
     @staticmethod
     def name() -> str:
         return "lightcoder-a4-no-managed-eval"
+
+
+class LightCoderC0Full64kAgent(LightCoderHarborAgent):
+    CONTEXT_WINDOW = 64_000
+
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-c0-full-64k"
+
+
+class LightCoderC2NoHandoffs64kAgent(LightCoderHarborAgent):
+    CONTEXT_WINDOW = 64_000
+    ABLATIONS = ("no-handoffs",)
+
+    @staticmethod
+    def name() -> str:
+        return "lightcoder-c2-no-handoffs-64k"
