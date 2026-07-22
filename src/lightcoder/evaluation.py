@@ -20,7 +20,6 @@ from .models import utc_now
 EVALUATOR_DIRNAME = ".lightcoder-eval"
 EVALUATOR_FILENAME = "evaluate.py"
 METRICS_FILENAME = "metrics.toml"
-CAPTURED_INPUTS_DIRNAME = ".lightcoder-eval-inputs"
 
 
 class EvaluationError(ValueError):
@@ -789,14 +788,11 @@ def _portable_workspace_argument(
     except ValueError:
         if not path.is_file():
             return value
-        # Agents commonly stage candidate artifacts under /tmp.  Capture those
-        # files at a stable argument-position path so the candidate commit is
-        # reproducible while the evaluator contract hash remains comparable.
-        destination = workspace / CAPTURED_INPUTS_DIRNAME
-        destination.mkdir(parents=True, exist_ok=True)
-        target = destination / f"arg-{index:02d}{path.suffix}"
-        shutil.copy2(path, target)
-        return target.relative_to(workspace).as_posix()
+        # Never copy external inputs into the business repository.  Benchmark
+        # verifiers correctly classify copied hidden inputs as target leakage.
+        # The path is run-local: optional managed evaluation requires the
+        # artifact to remain available for the duration of this run.
+        return str(path.resolve())
 
 
 def _hash_directory(directory: Path) -> str:

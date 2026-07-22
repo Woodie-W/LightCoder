@@ -63,9 +63,10 @@ lightcoder eval --adopt evaluate.py --primary S3 -- graph1 graph2 result.align
 This copies the script into the managed evaluator directory, records portable
 workspace-relative arguments, generates `metrics.toml`, and immediately submits
 the baseline. Existing file arguments outside the workspace, such as candidates
-under `/tmp`, are copied to stable paths under `.lightcoder-eval-inputs/` so the
-candidate commit remains reproducible. `--direction` defaults to `maximize` and
-also accepts `minimize`.
+under `/tmp`, remain outside the business repository. This avoids putting large
+or hidden evaluator inputs in a candidate submission; those files must remain
+available for the current evaluation run. `--direction` defaults to `maximize`
+and also accepts `minimize`.
 
 The native tool supports three operations:
 

@@ -328,7 +328,7 @@ def test_adopt_normalizes_natural_language_metric_name(tmp_path: Path) -> None:
     )
 
 
-def test_adopt_captures_external_candidate_at_stable_workspace_path(
+def test_adopt_keeps_external_candidate_outside_workspace(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -350,9 +350,7 @@ def test_adopt_captures_external_candidate_at_stable_workspace_path(
     )
     attempt = submit_evaluation(workspace, store=tmp_path / "store")
 
-    captured = workspace / ".lightcoder-eval-inputs" / "arg-00.align"
-    assert captured.read_text(encoding="utf-8") == "0.5\n"
     assert attempt["metrics"]["partial"] == pytest.approx(0.5)
     config = (adopted / "metrics.toml").read_text(encoding="utf-8")
-    assert str(external) not in config
-    assert ".lightcoder-eval-inputs/arg-00.align" in config
+    assert str(external) in config
+    assert not (workspace / ".lightcoder-eval-inputs").exists()
